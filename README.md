@@ -7,8 +7,9 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 - int8 量化 GEMM（u8×s8→s32）：AVX-VNNI 点积指令
 - f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
-- 组装式算子开发（CUTLASS 式）：fused attention（GQA/MHA/MQA）与 MLA
-  （DeepSeek 吸收式）作为 `examples/` 的组装参考，不进核心库——见「组织方式」
+- 组装式算子开发（CUTLASS 式）：fused attention（GQA/MHA/MQA）、MLA
+  （DeepSeek 吸收式）与 DSA（DeepSeek-V3.2 稀疏注意力）作为 `examples/` 的
+  组装参考，不进核心库——见「组织方式」
 - Split-K：深 k 自动切分 + 确定性两阶段归约
 - 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
 - ARM 支持：NEON / SVE2 定长 / SME（实验性）
@@ -18,12 +19,13 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 
 ```bash
 cmake -B build && cmake --build build -j
-ctest --test-dir build          # 15 个测试：11 个核心（simd/gemm/int8/f16/mx/fusion + 标量回退）
-                                 # + 4 个组装示例自校验（attention/mla × 普通/标量）
+ctest --test-dir build          # 17 个测试：11 个核心（simd/gemm/int8/f16/mx/fusion + 标量回退）
+                                 # + 6 个组装示例自校验（attention/mla/dsa × 普通/标量）
 ./build/basic_gemm              # 最小示例
 ./build/benchmark               # GFLOPS / GOPS 基准
 ./build/examples/02_fused_attention/fused_attention --bench   # fused attention
 ./build/examples/03_mla/mla --bench                           # MLA
+./build/examples/04_dsa/dsa --bench                           # DSA（对比稠密 MLA）
 ```
 
 ## 组织方式（CUTLASS 式）
@@ -32,7 +34,7 @@ ctest --test-dir build          # 15 个测试：11 个核心（simd/gemm/int8/f
 每个目录自包含：自己的头文件、自校验（double 参考 + 确定性断言）与基准合一的
 main、目录级 `CMakeLists.txt` 与 README，并挂到 CTest（含标量回退构建）。这与
 CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head_attention`
-而非核心库。要实现自己的算子（如 DSA / CSA），照抄一个目录：包含
+而非核心库。要实现自己的算子（如 CSA / KDA），照抄一个目录：包含
 `cpu_ops/detail/*` 原语头或相邻例子的头，在自己的编译单元里实例化。
 
 - `examples/02_fused_attention/`：fused 块内核 + `Attention<T>` 入口
@@ -40,8 +42,11 @@ CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head
   Q/K 归约深度与 V/O 宽度解耦 `dim_v`，供 MLA/稀疏变体复用）。
 - `examples/03_mla/`：吸收式 MLA = 每 head 吸收 GEMM → fused 核心
   （`heads_kv=1`、共享 [c‖k_pe] cache、`dim=dc+dp`、`dim_v=dc`）→ 反吸收 GEMM。
+- `examples/04_dsa/`：DSA（DeepSeek-V3.2 稀疏注意力）= lightning indexer
+  （ReLU 头混合打分，GEMM/GEMV 双路径）→ 因果前缀精确 top-k → CLS 汇总
+  token → gather + 无 pack M=1 稀疏行核（decode 专用小 M 内核的第一个实例）。
 - 确定性契约贯穿所有组装：kv-split 关闭时单/多线程**逐位一致**；开启时按固定
-  slice 顺序归并，跨运行**逐位一致**。
+  slice 顺序归并，跨运行**逐位一致**（DSA 的行路径无 split，天然逐位稳定）。
 
 CMake 选项：`CPU_OPS_ENABLE_NATIVE`（默认 ON，`-march=native`）、
 `CPU_OPS_BUILD_EXAMPLES`、`CPU_OPS_BUILD_TESTS`。
@@ -149,10 +154,11 @@ gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦�
 `(x, row, col)` + `apply_vec` 车道形式，可自由扩展。融合 epilogue 不在静态库中
 预实例化——包含 `gemm_fused.h` 即在自己的编译单元内联整个 kernel。
 
-### Attention / MLA（组装示例）
+### Attention / MLA / DSA（组装示例）
 
-fused attention 与 MLA 的完整用法、组装方式与扩展缝（CSA/KDA/DSA）见
-`examples/02_fused_attention/README.md` 与 `examples/03_mla/README.md`。要点：
+fused attention、MLA 与 DSA 的完整用法、组装方式与扩展缝见
+`examples/02_fused_attention/README.md`、`examples/03_mla/README.md` 与
+`examples/04_dsa/README.md`。要点：
 
 ```cpp
 #include "examples/02_fused_attention/attention.h"   // 或按例子目录引用
@@ -163,7 +169,9 @@ args.split_kv_slices = 0;                              // decode 自动 KV-split
 
 MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 `heads_kv=1、dim=dc+dp（如 576）、dim_v=dc（如 512）`，K/V 指向同一份
-`[seq_kv × (dc+dp)]` 共享 latent cache。
+`[seq_kv × (dc+dp)]` 共享 latent cache。DSA 复用同一潜空间：indexer 打分
+`Σ_j w_j·ReLU(q_idx_j·k_idx)` → 因果前缀精确 top-k → CLS 汇总行 →
+对 gather 出的 (k+1) 行做吸收式稀疏注意力（`DsaAttention<T>`）。
 
 ### 通用说明
 
@@ -186,6 +194,7 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA |
 | `attention::Attention<T>`（示例） | f32/f16/bf16 → 同型 | QKᵀ + online softmax + PV 融合，f32 累加 |
 | `attention::MlaAttention<T>`（示例） | 共享 latent cache → 每 head 输出 | 吸收式：2×GEMM + fused 核心（dim_v ≠ dim） |
+| `attention::DsaAttention<T>`（示例） | latent cache + indexer → 每 head 输出 | 稀疏式：indexer 打分 + 精确 top-k + CLS + 无 pack 行核 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
 乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
@@ -252,20 +261,38 @@ int8（u8×s8→s32）GOPS（一个乘积累加计 2 ops）：
 Fused attention（Apple M1 Pro，4T，H=16 d=128 causal f32）：seq 512/1024/2048
 分别 109 / 144 / 181 GFLOPS——约为同机纯 f32 GEMM 吞吐的 74%；bf16 操作数再快
 ~3%。MLA prefill（H=32，dn/dp/dc=128/64/512，f32）seq 1024/2048 为 230 /
-740 ms。decode（seq_q=1）目前走通用面板路径：GQA ~4.5 GB/s，MLA 更差
-（~0.3 GB/s：rows=1 时 K 面板打包成本无法摊销，且各 head 重复打包同一份共享
-K）——专用小 M / 免打包 decode 内核是当前最大的性能缺口。（数字来自
-`examples/*_attention|--bench`）
+740 ms。稠密 decode（seq_q=1）目前走通用面板路径：GQA ~4.5 GB/s，MLA ~0.3
+GB/s（rows=1 时 K 面板打包成本无法摊销，且各 head 重复打包同一份共享 K）。
+
+DSA decode（同机 4T，B=1 H=32，dn/dp/dc=128/64/512，indexer 64×128，
+topk=2048，bf16，对同形稠密 MLA）：
+
+| kv len | MLA 4T ms | DSA 4T ms | 加速比 | 有效 GB/s |
+|---|---|---|---|---|
+| 8192 | 29.4 | 9.7 | 3.0x | 16.0 |
+| 32768 | 113.9 | 18.5 | 6.2x | 31.7 |
+| 65536 | 226.0 | 29.8 | 7.6x | 38.9 |
+
+稀疏路径把每 token 的 KV 触达从整条 cache 降到 indexer key 流 + 一次 CLS
+扫描 + 2048 行 gather，且全部走无 pack 流式核——64k 上下文下 decode 提速
+7.6×。DSA prefill（512×8192）当前为 0.34×：逐行精确选集使注意力只能以
+M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_attention|--bench`
+与 `examples/04_dsa/dsa --bench`）
 
 ### 已知限制
 
 - GEMV 无专用 kernel，单线程 GEMV 约为 OpenBLAS 的 0.5x。
 - 单线程 kernel 相对 OpenBLAS 有 0.82–0.92x 的差距，来自微内核调优深度。
 - ARM 路径（NEON / SVE2 / SME）尚未在大规模部署中验证，SME 为实验性。
-- Attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低（MLA 下
-  尤甚：共享 K 被各 head 重复打包）；专用小 M / 免打包 decode 内核待做。
-  MLA→DSA→CSA 路线中，稀疏变体（DSA / CSA）尚未实现，扩展缝见
-  `attention/attention.h`。
+- 稠密 attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低
+  （MLA 下尤甚）；DSA 的稀疏行核是无 pack 小 M 路径的第一个实例，但窄存→f32
+  目前是逐元素软件转换（NEON `fcvtl` / AVX2 打包加载原语待做，decode 还能
+  再快 ~2–3×）。
+- DSA prefill 保持逐行精确 top-k 语义，注意力阶段只能 M=1 行核执行，慢于
+  稠密 GEMM 路径；查询面板共享选集（union of panel）以重回 GEMM 核是后续
+  工作。DSA 的 FP8 indexer 在 CPU 上的对应物（int8 点积原语）待接。
+- MLA→DSA→CSA 路线：DSA 已完成（`examples/04_dsa/`），CSA / KDA 未实现，
+  扩展缝见 `attention/attention.h`。
 
 ## 架构
 
@@ -360,5 +387,7 @@ examples/
 │   ├── CMakeLists.txt  README.md
 └── 03_mla/                          # 组装示例：吸收式 MLA（同构）
     ├── mla.h  mla.cc  CMakeLists.txt  README.md
-test/      核心单元测试（attention/mla 的校验在各自示例 main 中）
+└── 04_dsa/                          # 组装示例：DSA 稀疏注意力（同构）
+    ├── dsa.h  dsa.cc  CMakeLists.txt  README.md
+test/      核心单元测试（attention/mla/dsa 的校验在各自示例 main 中）
 ```
