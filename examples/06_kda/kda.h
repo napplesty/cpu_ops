@@ -61,6 +61,7 @@ namespace kda_detail {
 using dsa_detail::axpy_f32;
 using dsa_detail::del_buf;
 using dsa_detail::dot_f32;
+using dsa_detail::exp_scale_row;
 using dsa_detail::new_fbuf;
 using dsa_detail::run_batched;
 using dsa_detail::widen_row;
@@ -240,23 +241,40 @@ Status KdaAttention<T>::operator()(const Arguments& args, int num_threads) const
       kda_detail::del_buf(u);
       kda_detail::del_buf(ot);
     } else {
-      // Chunk scratch (f32): q̃,k̃,ṽ widened (+ q pre-scaled), G cumulative
-      // log-decay, factored-decay rows (qq/kk/khat, fast path), N and A
-      // kernels, rhs/Δ/bd rows.
+      // Chunk scratch (f32): widened q̃/k̃/ṽ (q pre-scaled), G cumulative
+      // log-decay, decay-combination rows (ktil = k·e^G, qtil = q·e^G,
+      // kcar = k·e^{G_C−G} — factors ≤ 1, always exact-safe), midpoint-
+      // factored rows (qq/kk/khat, kernel fast path), N/A kernels,
+      // rhs/Δ/bd, and [C×dv] panels for the GEMM path.
       float* qw = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
       float* kw = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
       float* vw = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dv);
       float* qq = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
       float* kk = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
       float* khat = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
+      float* ktil = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
+      float* qtil = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
+      float* kcar = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
       float* G = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dk);
+      float* gtmp = kda_detail::new_fbuf(dk);
       float* N = kda_detail::new_fbuf(static_cast<std::size_t>(C) * C);
       float* A = kda_detail::new_fbuf(static_cast<std::size_t>(C) * C);
       float* rhs = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dv);
       float* delta = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dv);
       float* bd = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dv);
+      float* ot2 = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dv);
+      float* abd = kda_detail::new_fbuf(static_cast<std::size_t>(C) * dv);
       float* u = kda_detail::new_fbuf(dv);
       float* ot = kda_detail::new_fbuf(dv);
+
+      // The chunk's six matrix products run on the library GEMM when the
+      // kernel factorization is safe (factored chunks); single-threaded per
+      // (batch, head) task, like the MLA absorb GEMMs.
+      using GemmRM_CM = typename mla_detail::AbsorbGemmFor<float>::Type;
+      using GemmRM_RM = gemm::device::Gemm<float, layout::RowMajor, float,
+                                           layout::RowMajor, float, layout::RowMajor>;
+      using GemmCM_RM = gemm::device::Gemm<float, layout::ColumnMajor, float,
+                                           layout::RowMajor, float, layout::RowMajor>;
 
       for (int c0 = 0; c0 < sq; c0 += C) {
         const int Ce = std::min(C, sq - c0);
@@ -279,86 +297,125 @@ Status KdaAttention<T>::operator()(const Arguments& args, int num_threads) const
             grow[c] = lg + (gprev ? gprev[c] : 0.0f);
           }
         }
+        const float* glast = G + static_cast<std::size_t>(Ce - 1) * dk;
+
         // Decay kernels come in two exact flavors. The pairwise kernel
         // ⟨a_t, b_s⟩_decay = Σ_c a[c]·b[c]·e^{G_t[c]−G_s[c]} costs an exp
         // per (pair, channel) — O(C²·dk) exps, which would dominate. When
         // the chunk's decay range stays moderate it factors exactly around
         // the per-channel midpoint m = G_last/2 as
         //   (a_t ⊙ e^{G_t − m}) · (b_s ⊙ e^{m − G_s}),
-        // a plain dot with the exps hoisted to O(C·dk); both factors stay
-        // within e^±70 while max_c |G_last[c]| ≤ 140, and the t ≥ s
-        // products still multiply to e^{G_t−G_s} ≤ 1. More extreme chunks
-        // (|G| > 140) fall back to the pairwise relative-exponent kernel,
-        // which is exact for any decay. The branch depends only on the
-        // data, so bit-stability is unaffected.
-        const float* glast = G + static_cast<std::size_t>(Ce - 1) * dk;
+        // both factors stay within e^±70 while max_c |G_last[c]| ≤ 140,
+        // and the t ≥ s products still multiply to e^{G_t−G_s} ≤ 1. More
+        // extreme chunks (|G| > 140) fall back to the pairwise kernel,
+        // exact for any decay. The branch depends only on the data, so
+        // bit-stability is unaffected.
         float R = 0.0f;
         for (int c = 0; c < dk; ++c) R = std::max(R, std::fabs(glast[c]));
         const bool factored = R <= 140.0f;
-        if (factored) {
-          for (int t = 0; t < Ce; ++t) {
-            const float* qrow = qw + static_cast<std::size_t>(t) * dk;
-            const float* krow = kw + static_cast<std::size_t>(t) * dk;
-            const float* grow = G + static_cast<std::size_t>(t) * dk;
-            float* qr = qq + static_cast<std::size_t>(t) * dk;
-            float* kr = kk + static_cast<std::size_t>(t) * dk;
-            float* kh = khat + static_cast<std::size_t>(t) * dk;
-            for (int c = 0; c < dk; ++c) {
-              const float m = 0.5f * glast[c];
-              const float e = std::expf(grow[c] - m);
-              qr[c] = qrow[c] * e;
-              kr[c] = krow[c] * e;
-              kh[c] = krow[c] / e;  // e^{m − G_s}, exact reciprocal range
-            }
-          }
-        }
-        // Kernels: N[t][s] = β_s·⟨k_t, k_s⟩_decay (strict lower),
-        //          A[t][s] = ⟨q_t, k_s⟩_decay (lower, diagonal included).
+
+        // Decay-combination rows on the fast vector exp (all ≤-1 factors
+        // except the factored khat side, which the range check covers).
         for (int t = 0; t < Ce; ++t) {
-          const float* kt = kw + static_cast<std::size_t>(t) * dk;
-          const float* qt = qw + static_cast<std::size_t>(t) * dk;
-          const float* gt = G + static_cast<std::size_t>(t) * dk;
-          const float* kkt = kk + static_cast<std::size_t>(t) * dk;
-          const float* qqt = qq + static_cast<std::size_t>(t) * dk;
-          for (int s = 0; s <= t; ++s) {
-            const float* ks = kw + static_cast<std::size_t>(s) * dk;
-            const float* gs = G + static_cast<std::size_t>(s) * dk;
-            const float* khs = khat + static_cast<std::size_t>(s) * dk;
-            float a, n;
-            if (factored) {
-              a = kda_detail::dot_f32(qqt, khs, dk);
-              n = kda_detail::dot_f32(kkt, khs, dk);
-            } else {
-              a = kda_detail::decay_dot(qt, ks, gt, gs, dk);
-              n = kda_detail::decay_dot(kt, ks, gt, gs, dk);
-            }
-            A[t * C + s] = a;
-            N[t * C + s] =
-                (t == s)
-                    ? 0.0f
-                    : n * kda_detail::sigmoidf_stable(static_cast<float>(bl[c0 + s]));
-          }
-        }
-        // rhs = V − K̃ S₀ with K̃ rows = k ⊙ e^G (factor ≤ 1: always safe).
-        for (int t = 0; t < Ce; ++t) {
+          const float* qrow = qw + static_cast<std::size_t>(t) * dk;
           const float* krow = kw + static_cast<std::size_t>(t) * dk;
           const float* grow = G + static_cast<std::size_t>(t) * dk;
-          for (int j = 0; j < dv; ++j) u[j] = 0.0f;
-          for (int c = 0; c < dk; ++c) {
-            const float kc = krow[c] * std::expf(grow[c]);
-            kda_detail::axpy_f32(kc, S + c * dv, u, dv);
-          }
-          float* rrow = rhs + static_cast<std::size_t>(t) * dv;
-          const float* vrow = vw + static_cast<std::size_t>(t) * dv;
-          for (int j = 0; j < dv; ++j) rrow[j] = vrow[j] - u[j];
+          kda_detail::exp_scale_row(krow, grow, ktil + static_cast<std::size_t>(t) * dk, dk);
+          kda_detail::exp_scale_row(qrow, grow, qtil + static_cast<std::size_t>(t) * dk, dk);
+          for (int c = 0; c < dk; ++c) gtmp[c] = glast[c] - grow[c];
+          kda_detail::exp_scale_row(krow, gtmp, kcar + static_cast<std::size_t>(t) * dk, dk);
         }
+        if (factored) {
+          for (int t = 0; t < Ce; ++t) {
+            const float* krow = kw + static_cast<std::size_t>(t) * dk;
+            const float* grow = G + static_cast<std::size_t>(t) * dk;
+            for (int c = 0; c < dk; ++c) gtmp[c] = grow[c] - 0.5f * glast[c];
+            kda_detail::exp_scale_row(qw + static_cast<std::size_t>(t) * dk, gtmp,
+                                      qq + static_cast<std::size_t>(t) * dk, dk);
+            kda_detail::exp_scale_row(krow, gtmp, kk + static_cast<std::size_t>(t) * dk, dk);
+            for (int c = 0; c < dk; ++c) gtmp[c] = -gtmp[c];
+            kda_detail::exp_scale_row(krow, gtmp, khat + static_cast<std::size_t>(t) * dk, dk);
+          }
+        }
+
+        // Kernels: N[t][s] = β_s·⟨k_t, k_s⟩_decay (strict lower),
+        //          A[t][s] = ⟨q_t, k_s⟩_decay (lower, diagonal included).
+        if (factored) {
+          // Full-square GEMMs; the discarded halves are masked right after.
+          GemmRM_CM gemm;
+          typename GemmRM_CM::Arguments ga;
+          ga.problem_size = {Ce, Ce, dk};
+          ga.ref_A = TensorRef<const float, layout::RowMajor>(qq, dk);
+          ga.ref_B = TensorRef<const float, layout::ColumnMajor>(khat, dk);
+          ga.ref_C = TensorRef<const float, layout::RowMajor>(A, C);
+          ga.ref_D = TensorRef<float, layout::RowMajor>(A, C);
+          ga.epilogue = {1.0f, 0.0f};
+          (void)gemm(ga, 1);
+          ga.ref_A = TensorRef<const float, layout::RowMajor>(kk, dk);
+          ga.ref_C = TensorRef<const float, layout::RowMajor>(N, C);
+          ga.ref_D = TensorRef<float, layout::RowMajor>(N, C);
+          (void)gemm(ga, 1);
+          for (int t = 0; t < Ce; ++t) {
+            for (int s2 = 0; s2 < Ce; ++s2) {
+              if (s2 > t) {
+                A[t * C + s2] = 0.0f;
+              } else if (s2 < t) {
+                N[t * C + s2] *=
+                    kda_detail::sigmoidf_stable(static_cast<float>(bl[c0 + s2]));
+              } else {
+                N[t * C + s2] = 0.0f;  // unit diagonal of (I + N)
+              }
+            }
+          }
+        } else {
+          for (int t = 0; t < Ce; ++t) {
+            const float* kt = kw + static_cast<std::size_t>(t) * dk;
+            const float* qt = qw + static_cast<std::size_t>(t) * dk;
+            const float* gt = G + static_cast<std::size_t>(t) * dk;
+            for (int s2 = 0; s2 <= t; ++s2) {
+              const float* ks = kw + static_cast<std::size_t>(s2) * dk;
+              const float* gs = G + static_cast<std::size_t>(s2) * dk;
+              A[t * C + s2] = kda_detail::decay_dot(qt, ks, gt, gs, dk);
+              N[t * C + s2] =
+                  (t == s2)
+                      ? 0.0f
+                      : kda_detail::decay_dot(kt, ks, gt, gs, dk) *
+                            kda_detail::sigmoidf_stable(static_cast<float>(bl[c0 + s2]));
+            }
+          }
+        }
+
+        // rhs = V − K̃ S₀ (K̃ rows = ktil): GEMM on the factored path.
+        if (factored) {
+          GemmRM_RM gemm;
+          typename GemmRM_RM::Arguments ga;
+          ga.problem_size = {Ce, dv, dk};
+          ga.ref_A = TensorRef<const float, layout::RowMajor>(ktil, dk);
+          ga.ref_B = TensorRef<const float, layout::RowMajor>(S, dv);
+          ga.ref_C = TensorRef<const float, layout::RowMajor>(vw, dv);
+          ga.ref_D = TensorRef<float, layout::RowMajor>(rhs, dv);
+          ga.epilogue = {-1.0f, 1.0f};  // D = −AB + C = V − K̃S
+          (void)gemm(ga, 1);
+        } else {
+          for (int t = 0; t < Ce; ++t) {
+            for (int j = 0; j < dv; ++j) u[j] = 0.0f;
+            const float* ktr = ktil + static_cast<std::size_t>(t) * dk;
+            for (int c = 0; c < dk; ++c) {
+              kda_detail::axpy_f32(ktr[c], S + c * dv, u, dv);
+            }
+            float* rrow = rhs + static_cast<std::size_t>(t) * dv;
+            const float* vrow = vw + static_cast<std::size_t>(t) * dv;
+            for (int j = 0; j < dv; ++j) rrow[j] = vrow[j] - u[j];
+          }
+        }
+
         // Forward substitution: Δ_t = rhs_t − Σ_{s<t} N[t][s]·Δ_s.
         for (int t = 0; t < Ce; ++t) {
           float* drow = delta + static_cast<std::size_t>(t) * dv;
           const float* rrow = rhs + static_cast<std::size_t>(t) * dv;
           std::memcpy(drow, rrow, static_cast<std::size_t>(dv) * sizeof(float));
-          for (int s = 0; s < t; ++s) {
-            kda_detail::axpy_f32(-N[t * C + s], delta + static_cast<std::size_t>(s) * dv,
+          for (int s2 = 0; s2 < t; ++s2) {
+            kda_detail::axpy_f32(-N[t * C + s2], delta + static_cast<std::size_t>(s2) * dv,
                                  drow, dv);
           }
           const float beta_t =
@@ -366,37 +423,71 @@ Status KdaAttention<T>::operator()(const Arguments& args, int num_threads) const
           float* brow = bd + static_cast<std::size_t>(t) * dv;
           for (int j = 0; j < dv; ++j) brow[j] = beta_t * drow[j];
         }
+
         // Outputs: o_t = (q_t ⊙ e^{G_t})ᵀS₀ + Σ_{s≤t} A[t][s]·β_sδ_s.
-        for (int t = 0; t < Ce; ++t) {
-          const float* qrow = qw + static_cast<std::size_t>(t) * dk;
-          const float* grow = G + static_cast<std::size_t>(t) * dk;
-          for (int j = 0; j < dv; ++j) ot[j] = 0.0f;
-          for (int c = 0; c < dk; ++c) {
-            const float qc = qrow[c] * std::expf(grow[c]);  // factor ≤ 1
-            kda_detail::axpy_f32(qc, S + c * dv, ot, dv);
+        if (factored) {
+          GemmRM_RM gemm;
+          typename GemmRM_RM::Arguments ga;
+          ga.problem_size = {Ce, dv, dk};
+          ga.ref_A = TensorRef<const float, layout::RowMajor>(qtil, dk);
+          ga.ref_B = TensorRef<const float, layout::RowMajor>(S, dv);
+          ga.ref_C = TensorRef<const float, layout::RowMajor>(ot2, dv);
+          ga.ref_D = TensorRef<float, layout::RowMajor>(ot2, dv);
+          ga.epilogue = {1.0f, 0.0f};
+          (void)gemm(ga, 1);
+          ga.problem_size = {Ce, dv, Ce};
+          ga.ref_A = TensorRef<const float, layout::RowMajor>(A, C);
+          ga.ref_B = TensorRef<const float, layout::RowMajor>(bd, dv);
+          ga.ref_C = TensorRef<const float, layout::RowMajor>(abd, dv);
+          ga.ref_D = TensorRef<float, layout::RowMajor>(abd, dv);
+          (void)gemm(ga, 1);
+          for (int t = 0; t < Ce; ++t) {
+            T* orow = o + static_cast<std::size_t>(c0 + t) * args.o_ld;
+            const float* o1 = ot2 + static_cast<std::size_t>(t) * dv;
+            const float* o2 = abd + static_cast<std::size_t>(t) * dv;
+            for (int j = 0; j < dv; ++j) orow[j] = T(o1[j] + o2[j]);
           }
-          for (int s = 0; s <= t; ++s) {
-            kda_detail::axpy_f32(A[t * C + s], bd + static_cast<std::size_t>(s) * dv,
-                                 ot, dv);
+        } else {
+          for (int t = 0; t < Ce; ++t) {
+            const float* qtr = qtil + static_cast<std::size_t>(t) * dk;
+            for (int j = 0; j < dv; ++j) ot[j] = 0.0f;
+            for (int c = 0; c < dk; ++c) {
+              kda_detail::axpy_f32(qtr[c], S + c * dv, ot, dv);
+            }
+            for (int s2 = 0; s2 <= t; ++s2) {
+              kda_detail::axpy_f32(A[t * C + s2], bd + static_cast<std::size_t>(s2) * dv,
+                                   ot, dv);
+            }
+            T* orow = o + static_cast<std::size_t>(c0 + t) * args.o_ld;
+            for (int j = 0; j < dv; ++j) orow[j] = T(ot[j]);
           }
-          T* orow = o + static_cast<std::size_t>(c0 + t) * args.o_ld;
-          for (int j = 0; j < dv; ++j) orow[j] = T(ot[j]);
         }
-        // State: S = diag(e^{G_Ce})S₀ + Σ_t (k_t ⊙ e^{G_Ce−G_t}) ⊗ bd_t.
-        // Both decay factors are ≤ 1: always safe.
+
+        // State: S = diag(e^{G_Ce})S₀ + Σ_t (k_t ⊙ e^{G_Ce−G_t}) ⊗ bd_t —
+        // the K̂ᵀ·BD rank-Ce update is a GEMM accumulating in place.
         {
           for (int c = 0; c < dk; ++c) {
             const float lc = std::expf(glast[c]);
             float* row = S + c * dv;
             for (int j = 0; j < dv; ++j) row[j] *= lc;
           }
-          for (int t = 0; t < Ce; ++t) {
-            const float* krow = kw + static_cast<std::size_t>(t) * dk;
-            const float* grow = G + static_cast<std::size_t>(t) * dk;
-            const float* brow = bd + static_cast<std::size_t>(t) * dv;
-            for (int c = 0; c < dk; ++c) {
-              const float kc = krow[c] * std::expf(glast[c] - grow[c]);
-              kda_detail::axpy_f32(kc, brow, S + c * dv, dv);
+          if (factored) {
+            GemmCM_RM gemm;
+            typename GemmCM_RM::Arguments ga;
+            ga.problem_size = {dk, dv, Ce};
+            ga.ref_A = TensorRef<const float, layout::ColumnMajor>(kcar, dk);
+            ga.ref_B = TensorRef<const float, layout::RowMajor>(bd, dv);
+            ga.ref_C = TensorRef<const float, layout::RowMajor>(S, dv);
+            ga.ref_D = TensorRef<float, layout::RowMajor>(S, dv);
+            ga.epilogue = {1.0f, 1.0f};
+            (void)gemm(ga, 1);
+          } else {
+            for (int t = 0; t < Ce; ++t) {
+              const float* kcr = kcar + static_cast<std::size_t>(t) * dk;
+              const float* brow = bd + static_cast<std::size_t>(t) * dv;
+              for (int c = 0; c < dk; ++c) {
+                kda_detail::axpy_f32(kcr[c], brow, S + c * dv, dv);
+              }
             }
           }
         }
@@ -407,12 +498,18 @@ Status KdaAttention<T>::operator()(const Arguments& args, int num_threads) const
       kda_detail::del_buf(qq);
       kda_detail::del_buf(kk);
       kda_detail::del_buf(khat);
+      kda_detail::del_buf(ktil);
+      kda_detail::del_buf(qtil);
+      kda_detail::del_buf(kcar);
       kda_detail::del_buf(G);
+      kda_detail::del_buf(gtmp);
       kda_detail::del_buf(N);
       kda_detail::del_buf(A);
       kda_detail::del_buf(rhs);
       kda_detail::del_buf(delta);
       kda_detail::del_buf(bd);
+      kda_detail::del_buf(ot2);
+      kda_detail::del_buf(abd);
       kda_detail::del_buf(u);
       kda_detail::del_buf(ot);
     }

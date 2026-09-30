@@ -168,6 +168,25 @@ inline void widen_row(const T* x, float* y, int n, float s = 1.0f) {
   for (; i < n; ++i) y[i] = s * static_cast<float>(x[i]);
 }
 
+// y[i] = s · x[i] · exp(g[i]) — the exp runs on the fast vector exp2
+// polynomial instead of per-element libm calls (row builders that fire
+// O(C·dk) of these per chunk, e.g. the KDA decay combinations).
+template <typename T>
+inline void exp_scale_row(const T* x, const float* g, float* y, int n,
+                          float s = 1.0f) {
+  constexpr int W = simd::native_width<float>();
+  using FV = simd::Vec<float, W>;
+  const FV log2e = FV::set1(1.4426950408889634f);
+  int i = 0;
+  for (; i + W <= n; i += W) {
+    const FV e = simd::exp2(simd::mul(FV::load(g + i), log2e));
+    FV v = simd::mul(widen_vec<W>(x + i), e);
+    if (s != 1.0f) v = simd::mul(v, FV::set1(s));
+    v.store(y + i);
+  }
+  for (; i < n; ++i) y[i] = s * static_cast<float>(x[i]) * std::expf(g[i]);
+}
+
 }  // namespace dsa_detail
 
 template <typename T>

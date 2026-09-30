@@ -316,9 +316,9 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
   稠密 GEMM 路径（DSA 0.34x / CSA 0.53x @512×8192）；查询面板共享选集以
   重回 GEMM 核是后续工作。DSA 的 FP8 indexer 在 CPU 上的对应物（int8 点积
   原语）待接。
-- KDA chunked 当前行核实现不快于 naive（~0.77x）：两条路径的每 token 主导
-  成本都是 3–4 次 dk×dv 状态扫描；把块内六个矩阵运算改走库 GEMM 原语是
-  明确的加速路径（见 `examples/06_kda/README.md`）。
+- KDA chunked 的块内六矩阵运算已走库 GEMM 原语（衰减行向量 exp2 构建），
+  对 naive 提速 ~1.45×（8192: 446→307 ms，4T）；前代求解与极端衰减
+  （|G|>140/块）保留标量精确路径。
 - MLA→DSA→CSA→KDA 路线已全部完成（`examples/02`–`06`）；后续为性能项（见
   上）与 GEMV / 窄存向量加载等既有缺口。
 

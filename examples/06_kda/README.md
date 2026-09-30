@@ -58,17 +58,17 @@ best-of-2/3）
 
 | seq | naive 4T ms | chunk 1T ms | chunk 4T ms | chunk/naive |
 |---|---|---|---|---|
-| 2048 | 104.5 | 531.0 | 142.4 | 0.73 |
-| 8192 | 436.5 | 2142.1 | 566.8 | 0.77 |
+| 2048 | 113.4 | 281.0 | 78.5 | 1.44 |
+| 8192 | 446.1 | 1119.7 | 306.5 | 1.46 |
 
-如实记录：当前行核实现下 chunked **不快于** naive。两条路径每 token 的
-主导成本都是 3–4 次 dk×dv 状态扫描（衰减/读/写/输出），块化只省其一，
-而块机 overhead（成对核 + 前代）与之相抵。chunkwise 的本意是把块内
-六个矩阵运算（K̃·S、Q̃·S、K̂ᵀ·BD、A/N 核、三角求解）变成张量核上的
-matmul——CPU 上的对应做法是把它们改走库的 GEMM 原语（每块 6 个
-[C×dk]·[dk×dv] 级别的 GEMM），这是明确的后续性能项（见主 README 路线
-图）；naive 路径本身已是合格的 decode 内核（每 token O(dk·dv) 常数工
-作 + 状态跨调用传递）。
+块内的六个矩阵运算（A/N 核 `QQ·K̂ᵀ`/`KK·K̂ᵀ`、`rhs = −K̃S+V`、`Q̃S`、
+`A·BD`、`S += K̂ᵀ·BD` 原地累加）在因子化安全的块上走库 GEMM 原语（单
+线程逐 (batch,head) 任务调用，与 MLA 吸收 GEMM 同模式），衰减组合行
+（k̃/q̃/k̂）与因子化行用 `exp_scale_row` 的向量 exp2 多项式构建（替代每
+块 ~6·C·dk 次标量 expf）；前代求解与极端衰减回退（|G|>140）保留标量
+路径。GEMM 化后 chunked 反超 naive ~1.45×（此前行核版为 0.77×）；naive
+路径仍是 decode 内核（每 token O(dk·dv) 常数工作 + 状态跨调用传递），
+长序列 prefill 用 chunked。
 
 **与 02-05 示例的关系**：这是第一个非 softmax 注意力（无 running max、
 无归一化分母），权重变换从 `exp2(x−m)` 换成 sigmoid 门控衰减——即
