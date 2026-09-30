@@ -8,8 +8,9 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 - f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
 - 组装式算子开发（CUTLASS 式）：fused attention（GQA/MHA/MQA）、MLA
-  （DeepSeek 吸收式）、DSA（DeepSeek-V3.2 稀疏注意力）与 CSA（NSA 式
-  压缩稀疏注意力）作为 `examples/` 的组装参考，不进核心库——见「组织方式」
+  （DeepSeek 吸收式）、DSA（DeepSeek-V3.2 稀疏注意力）、CSA（NSA 式
+  压缩稀疏注意力）与 KDA（Kimi Delta Attention，naive/chunk 双模式）
+  作为 `examples/` 的组装参考，不进核心库——见「组织方式」
 - Split-K：深 k 自动切分 + 确定性两阶段归约
 - 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
 - ARM 支持：NEON / SVE2 定长 / SME（实验性）
@@ -19,14 +20,15 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 
 ```bash
 cmake -B build && cmake --build build -j
-ctest --test-dir build          # 19 个测试：11 个核心（simd/gemm/int8/f16/mx/fusion + 标量回退）
-                                 # + 8 个组装示例自校验（attention/mla/dsa/csa × 普通/标量）
+ctest --test-dir build          # 21 个测试：11 个核心（simd/gemm/int8/f16/mx/fusion + 标量回退）
+                                 # + 10 个组装示例自校验（attention/mla/dsa/csa/kda × 普通/标量）
 ./build/basic_gemm              # 最小示例
 ./build/benchmark               # GFLOPS / GOPS 基准
 ./build/examples/02_fused_attention/fused_attention --bench   # fused attention
 ./build/examples/03_mla/mla --bench                           # MLA
 ./build/examples/04_dsa/dsa --bench                           # DSA（对比稠密 MLA）
 ./build/examples/05_csa/csa --bench                           # CSA（对比稠密 MLA）
+./build/examples/06_kda/kda --bench                           # KDA（naive vs chunked）
 ```
 
 ## 组织方式（CUTLASS 式）
@@ -35,7 +37,7 @@ ctest --test-dir build          # 19 个测试：11 个核心（simd/gemm/int8/f
 每个目录自包含：自己的头文件、自校验（double 参考 + 确定性断言）与基准合一的
 main、目录级 `CMakeLists.txt` 与 README，并挂到 CTest（含标量回退构建）。这与
 CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head_attention`
-而非核心库。要实现自己的算子（如 KDA），照抄一个目录：包含
+而非核心库。要实现自己的算子，照抄一个目录：包含
 `cpu_ops/detail/*` 原语头或相邻例子的头，在自己的编译单元里实例化。
 
 - `examples/02_fused_attention/`：fused 块内核 + `Attention<T>` 入口
@@ -50,6 +52,10 @@ CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head
   φ 缓存）+ 选块分支（**打分复用压缩分支 softmax 分数**、跨头求和、整块
   gather、固定激活首块/局部块）+ 窗口分支，sigmoid 门控求和；复用 04 的
   流式行核原语。
+- `examples/06_kda/`：KDA（Kimi Delta Attention，门控 delta 规则线性注意
+  力）双模式——naive 逐 token 递归（decode 路径，状态经 s0/s_out 跨调用
+  传递）与 chunkwise 并行（块内 (I+N)⁻¹ 前代 + 注意力形状核；衰减核带
+  精确因子化快路径 + 极端衰减回退）。
 - 确定性契约贯穿所有组装：kv-split 关闭时单/多线程**逐位一致**；开启时按固定
   slice 顺序归并，跨运行**逐位一致**（DSA/CSA 的行路径无 split，天然逐位稳定）。
 
@@ -159,10 +165,10 @@ gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦�
 `(x, row, col)` + `apply_vec` 车道形式，可自由扩展。融合 epilogue 不在静态库中
 预实例化——包含 `gemm_fused.h` 即在自己的编译单元内联整个 kernel。
 
-### Attention / MLA / DSA / CSA（组装示例）
+### Attention / MLA / DSA / CSA / KDA（组装示例）
 
-fused attention、MLA、DSA 与 CSA 的完整用法、组装方式与扩展缝见
-`examples/02_fused_attention/README.md` … `examples/05_csa/README.md`。要点：
+fused attention、MLA、DSA、CSA 与 KDA 的完整用法、组装方式与扩展缝见
+`examples/02_fused_attention/README.md` … `examples/06_kda/README.md`。要点：
 
 ```cpp
 #include "examples/02_fused_attention/attention.h"   // 或按例子目录引用
@@ -200,6 +206,7 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `attention::MlaAttention<T>`（示例） | 共享 latent cache → 每 head 输出 | 吸收式：2×GEMM + fused 核心（dim_v ≠ dim） |
 | `attention::DsaAttention<T>`（示例） | latent cache + indexer → 每 head 输出 | 稀疏式：indexer 打分 + 精确 top-k + CLS + 无 pack 行核 |
 | `attention::CsaAttention<T>`（示例） | latent cache（+压缩缓存）→ 每 head 输出 | 三分支：压缩/选块（top-n 块）/窗口，sigmoid 门控求和 |
+| `attention::KdaAttention<T>`（示例） | q/k/v + β/λ logits（+初始状态）→ 输出 + 终态 | 线性注意力：门控 delta 规则，naive/chunk 双模式 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
 乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
@@ -307,9 +314,11 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
   稠密 GEMM 路径（DSA 0.34x / CSA 0.53x @512×8192）；查询面板共享选集以
   重回 GEMM 核是后续工作。DSA 的 FP8 indexer 在 CPU 上的对应物（int8 点积
   原语）待接。
-- MLA→DSA→CSA 路线：DSA、CSA 已完成（`examples/04_dsa/`、`examples/05_csa/`），
-  KDA（sigmoid-decay 权重变换替换 exp2，无 running max）未实现，扩展缝见
-  `attention/attention.h`。
+- KDA chunked 当前行核实现不快于 naive（~0.77x）：两条路径的每 token 主导
+  成本都是 3–4 次 dk×dv 状态扫描；把块内六个矩阵运算改走库 GEMM 原语是
+  明确的加速路径（见 `examples/06_kda/README.md`）。
+- MLA→DSA→CSA→KDA 路线已全部完成（`examples/02`–`06`）；后续为性能项（见
+  上）与 GEMV / 窄存向量加载等既有缺口。
 
 ## 架构
 
@@ -408,5 +417,7 @@ examples/
     ├── dsa.h  dsa.cc  CMakeLists.txt  README.md
 └── 05_csa/                          # 组装示例：CSA（NSA 式三分支，复用 04 行核）
     ├── csa.h  csa.cc  CMakeLists.txt  README.md
-test/      核心单元测试（attention/mla/dsa/csa 的校验在各自示例 main 中）
+└── 06_kda/                          # 组装示例：KDA（naive/chunk 双模式）
+    ├── kda.h  kda.cc  CMakeLists.txt  README.md
+test/      核心单元测试（attention/mla/dsa/csa/kda 的校验在各自示例 main 中）
 ```
