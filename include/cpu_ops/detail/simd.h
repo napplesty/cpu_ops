@@ -90,6 +90,13 @@ inline Vec<T, N> sub(const Vec<T, N>& a, const Vec<T, N>& b) {
 }
 
 template <typename T, int N>
+inline Vec<T, N> div(const Vec<T, N>& a, const Vec<T, N>& b) {
+  Vec<T, N> r;
+  for (int i = 0; i < N; ++i) r.v[i] = a.v[i] / b.v[i];
+  return r;
+}
+
+template <typename T, int N>
 inline Vec<T, N> max(const Vec<T, N>& a, const Vec<T, N>& b) {
   Vec<T, N> r;
   for (int i = 0; i < N; ++i) r.v[i] = a.v[i] < b.v[i] ? b.v[i] : a.v[i];
@@ -170,6 +177,54 @@ inline Vec<float, W> widen_bf16(const uint16_t* p) {
   return r;
 }
 
+// f32 -> IEEE binary16 bits, round-to-nearest-even (scalar fallback path).
+inline uint16_t f32_bits_to_f16_bits(uint32_t f) {
+  const uint32_t sign = (f >> 16) & 0x8000;
+  const uint32_t fexp = (f >> 23) & 0xFF;
+  const uint32_t mant = f & 0x7FFFFF;
+  if (fexp == 0xFF) return static_cast<uint16_t>(sign | 0x7C00 | (mant >> 13) | (mant ? 0x200 : 0));
+  const int exp = static_cast<int>(fexp) - 127 + 15;
+  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00);  // overflow -> inf
+  if (exp <= 0) {
+    if (exp < -10) return static_cast<uint16_t>(sign);  // underflow -> zero
+    const uint32_t mant24 = mant | 0x800000;
+    const int shift = 14 - exp;
+    uint32_t half = mant24 >> shift;
+    const uint32_t rem = mant24 & ((1u << shift) - 1);
+    const uint32_t halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (half & 1))) ++half;
+    return static_cast<uint16_t>(sign | half);
+  }
+  uint32_t half = (static_cast<uint32_t>(exp) << 10) | (mant >> 13);
+  const uint32_t rem = mant & 0x1FFF;
+  if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
+  return static_cast<uint16_t>(sign | half);
+}
+
+// Round W f32 lanes down to narrow storage. bf16 rounds to nearest-even via
+// the integer trick (u + 0x7FFF + lsb) >> 16.
+template <int W>
+inline void narrow_f16(const Vec<float, W>& v, uint16_t* p) {
+  float t[W];
+  v.store(t);
+  for (int i = 0; i < W; ++i) {
+    uint32_t b;
+    std::memcpy(&b, &t[i], 4);
+    p[i] = f32_bits_to_f16_bits(b);
+  }
+}
+
+template <int W>
+inline void narrow_bf16(const Vec<float, W>& v, uint16_t* p) {
+  float t[W];
+  v.store(t);
+  for (int i = 0; i < W; ++i) {
+    uint32_t b;
+    std::memcpy(&b, &t[i], 4);
+    p[i] = static_cast<uint16_t>((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16);
+  }
+}
+
 // ---- Softmax helpers (f32 lanes) -----------------------------------------
 // The generic implementations round-trip through a stack array so they work
 // for every Vec flavor (scalar fallback and SVE included); AVX2 and NEON
@@ -202,6 +257,47 @@ inline float hsum(const Vec<float, N>& x) {
   return s;
 }
 
+
+// ---- Nonlinear math on f32 lanes ------------------------------------------
+// All composed from exp2 (which dispatches per ISA) plus div, so every Vec
+// width gets the fast path; fixed formulas keep results bit-stable.
+
+// tanh(x), inputs clamped to |x| <= 15 (tanh(15) rounds to 1 in f32; the
+// unclamped form would hit inf/inf at e^{2x}).
+template <int N>
+inline Vec<float, N> tanh(Vec<float, N> x) {
+  using FV = Vec<float, N>;
+  const FV c = min(max(x, FV::set1(-15.0f)), FV::set1(15.0f));
+  const FV e = exp2(mul(c, FV::set1(2.8853900817779268f)));  // e^{2x}
+  return div(sub(e, FV::set1(1.0f)), add(e, FV::set1(1.0f)));
+}
+
+// sigmoid(x), inputs clamped to |x| <= 80 (keeps exp in range).
+template <int N>
+inline Vec<float, N> sigmoid(Vec<float, N> x) {
+  using FV = Vec<float, N>;
+  const FV c = min(max(x, FV::set1(-80.0f)), FV::set1(80.0f));
+  const FV e = exp2(mul(c, FV::set1(-1.4426950408889634f)));  // e^{-x}
+  return div(FV::set1(1.0f), add(FV::set1(1.0f), e));
+}
+
+// silu(x) = x * sigmoid(x)
+template <int N>
+inline Vec<float, N> silu(Vec<float, N> x) {
+  return mul(x, sigmoid(x));
+}
+
+// gelu(x), tanh approximation (PyTorch's approximate="tanh"):
+//   0.5x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+template <int N>
+inline Vec<float, N> gelu(Vec<float, N> x) {
+  using FV = Vec<float, N>;
+  const FV inner = mul(
+      FV::set1(0.7978845608028654f),
+      mul(x, add(FV::set1(1.0f), mul(FV::set1(0.044715f), mul(x, x)))));
+  return mul(FV::set1(0.5f), mul(x, add(FV::set1(1.0f), tanh(inner))));
+}
+
 #if defined(CPU_OPS_SIMD_AVX2)
 
 template <>
@@ -228,6 +324,9 @@ inline Vec<float, 8> add(const Vec<float, 8>& a, const Vec<float, 8>& b) {
 inline Vec<float, 8> sub(const Vec<float, 8>& a, const Vec<float, 8>& b) {
   return _mm256_sub_ps(a.v, b.v);
 }
+inline Vec<float, 8> div(const Vec<float, 8>& a, const Vec<float, 8>& b) {
+  return _mm256_div_ps(a.v, b.v);
+}
 
 // Widening loads: bf16 is a zero-extend + shift; f16 wants F16C (present on
 // effectively every AVX2 part) and otherwise stays on the generic path.
@@ -244,6 +343,26 @@ inline Vec<float, 8> widen_f16<8>(const uint16_t* p) {
   Vec<float, 8> r;
   r.v = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
   return r;
+}
+#endif
+
+template <>
+inline void narrow_bf16<8>(const Vec<float, 8>& v, uint16_t* p) {
+  const __m256i u = _mm256_castps_si256(v.v);
+  const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
+  const __m256i r =
+      _mm256_add_epi32(_mm256_add_epi32(u, _mm256_set1_epi32(0x7FFF)), lsb);
+  const __m256i r16 = _mm256_srli_epi32(r, 16);
+  const __m128i lo = _mm256_castsi256_si128(r16);
+  const __m128i hi = _mm256_extracti128_si256(r16, 1);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(p), _mm_packus_epi32(lo, hi));
+}
+#if defined(__F16C__)
+template <>
+inline void narrow_f16<8>(const Vec<float, 8>& v, uint16_t* p) {
+  const __m128i h = _mm256_cvtps_ph(
+      v.v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(p), h);
 }
 #endif
 inline Vec<float, 8> max(const Vec<float, 8>& a, const Vec<float, 8>& b) {
@@ -465,6 +584,9 @@ inline Vec<float, 4> add(const Vec<float, 4>& a, const Vec<float, 4>& b) {
 inline Vec<float, 4> sub(const Vec<float, 4>& a, const Vec<float, 4>& b) {
   return vsubq_f32(a.v, b.v);
 }
+inline Vec<float, 4> div(const Vec<float, 4>& a, const Vec<float, 4>& b) {
+  return vdivq_f32(a.v, b.v);
+}
 
 // Widening loads: f16 is one vcvt per 4 lanes; bf16 is a 16-bit left shift
 // into the f32 lanes.
@@ -479,6 +601,18 @@ inline Vec<float, 4> widen_bf16<4>(const uint16_t* p) {
   Vec<float, 4> r;
   r.v = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
   return r;
+}
+
+template <>
+inline void narrow_f16<4>(const Vec<float, 4>& v, uint16_t* p) {
+  vst1_u16(p, vreinterpret_u16_f16(vcvt_f16_f32(v.v)));
+}
+template <>
+inline void narrow_bf16<4>(const Vec<float, 4>& v, uint16_t* p) {
+  const uint32x4_t u = vreinterpretq_u32_f32(v.v);
+  const uint32x4_t lsb = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1));
+  const uint32x4_t r = vaddq_u32(vaddq_u32(u, vdupq_n_u32(0x7FFF)), lsb);
+  vst1_u16(p, vmovn_u32(vshrq_n_u32(r, 16)));
 }
 inline Vec<float, 4> max(const Vec<float, 4>& a, const Vec<float, 4>& b) {
   return vmaxq_f32(a.v, b.v);

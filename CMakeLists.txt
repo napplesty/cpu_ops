@@ -19,6 +19,7 @@ set(CPU_OPS_SOURCES
   src/gemm_vnni.cc
   src/gemm_mx.cc
   src/gemm_sme_f32.cc
+  src/ops.cc
   src/thread_pool.cc
   src/thread_swizzle.cc)
 
@@ -64,6 +65,9 @@ if(CPU_OPS_BUILD_TESTS)
   add_executable(test_fusion test/test_fusion.cc)
   target_link_libraries(test_fusion PRIVATE cpu_ops cpu_ops_build_flags)
 
+  add_executable(test_ops test/test_ops.cc)
+  target_link_libraries(test_ops PRIVATE cpu_ops cpu_ops_build_flags)
+
   # Same suites against the portable scalar fallback (no SIMD intrinsics):
   # each pairs a test file with the library sources compiled with
   # CPU_OPS_FORCE_SCALAR.
@@ -79,17 +83,20 @@ if(CPU_OPS_BUILD_TESTS)
   add_scalar_test(test_gemm_int8_scalar test/test_gemm_int8.cc)
   add_scalar_test(test_gemm_f16_scalar test/test_gemm_f16.cc)
   add_scalar_test(test_gemm_mx_scalar test/test_gemm_mx.cc)
+  add_scalar_test(test_ops_scalar test/test_ops.cc)
   add_test(NAME simd COMMAND test_simd)
   add_test(NAME gemm COMMAND test_gemm)
   add_test(NAME gemm_int8 COMMAND test_gemm_int8)
   add_test(NAME gemm_f16 COMMAND test_gemm_f16)
   add_test(NAME gemm_mx COMMAND test_gemm_mx)
+  add_test(NAME ops COMMAND test_ops)
   add_test(NAME fusion COMMAND test_fusion)
   add_test(NAME fusion_scalar COMMAND test_fusion_scalar)
   add_test(NAME gemm_scalar COMMAND test_gemm_scalar)
   add_test(NAME gemm_int8_scalar COMMAND test_gemm_int8_scalar)
   add_test(NAME gemm_f16_scalar COMMAND test_gemm_f16_scalar)
   add_test(NAME gemm_mx_scalar COMMAND test_gemm_mx_scalar)
+  add_test(NAME ops_scalar COMMAND test_ops_scalar)
 endif()
 
 # Assembled-operator examples (CUTLASS style): each directory owns its

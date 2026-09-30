@@ -8,4 +8,7 @@
 #include "cpu_ops/layout.h"
 #include "cpu_ops/matrix_shape.h"
 #include "cpu_ops/mx_formats.h"
+#include "cpu_ops/ops/activation.h"
+#include "cpu_ops/ops/norm.h"
+#include "cpu_ops/ops/topk.h"
 #include "cpu_ops/status.h"

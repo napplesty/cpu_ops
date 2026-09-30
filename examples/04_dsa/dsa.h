@@ -71,6 +71,7 @@
 
 #include "../03_mla/mla.h"  // AbsorbGemmFor: storage-typed GEMM with f32 output
 #include "cpu_ops/detail/simd.h"
+#include "cpu_ops/ops/topk.h"
 #include "cpu_ops/detail/thread_pool.h"
 #include "cpu_ops/element_types.h"
 #include "cpu_ops/status.h"
@@ -414,18 +415,13 @@ Status DsaAttention<T>::operator()(const Arguments& args, int num_threads) const
         for (int s = n_i; s < skv; ++s) out[s] = 0.0f;
       }
 
-      // Exact top-k over [0, n_i): (score desc, index asc) totally orders
-      // the candidates, so the set is deterministic; gathered rows go back
-      // to ascending order. sel[topk] publishes k_eff to phases 1c and 2.
+      // Exact top-k over [0, n_i) via the radix-select primitive — the
+      // (score desc, index asc) contract is bit-identical to the
+      // partial_sort formulation; gathered rows go back to ascending
+      // order. sel[topk] publishes k_eff to phases 1c and 2.
       const int k_eff = std::min(topk, n_i);
-      int32_t* id = idx + static_cast<std::size_t>(r) * idx_elems;
-      for (int s = 0; s < n_i; ++s) id[s] = s;
-      const auto by_score = [&sc](int32_t x, int32_t y) {
-        return sc[x] != sc[y] ? sc[x] > sc[y] : x < y;
-      };
-      std::partial_sort(id, id + k_eff, id + n_i, by_score);
-      int32_t* sel = id + skv;
-      std::copy(id, id + k_eff, sel);
+      int32_t* sel = idx + static_cast<std::size_t>(r) * idx_elems + skv;
+      cpu_ops::ops::topk_indices(sc, n_i, k_eff, sel);
       std::sort(sel, sel + k_eff);
       sel[topk] = k_eff;
 

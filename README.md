@@ -11,6 +11,9 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
   （DeepSeek 吸收式）、DSA（DeepSeek-V3.2 稀疏注意力）、CSA（NSA 式
   压缩稀疏注意力）与 KDA（Kimi Delta Attention，naive/chunk 双模式）
   作为 `examples/` 的组装参考，不进核心库——见「组织方式」
+- ops 层原语：激活（gelu/silu）、归一化（rmsnorm / fused add+rmsnorm /
+  layernorm）、精确 top-k（radix-select，与 partial_sort 逐位同语义）；
+  融合 epilogue 目录含 GeLU/SiLu
 - Split-K：深 k 自动切分 + 确定性两阶段归约
 - 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
 - ARM 支持：NEON / SVE2 定长 / SME（实验性）
@@ -20,7 +23,7 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 
 ```bash
 cmake -B build && cmake --build build -j
-ctest --test-dir build          # 21 个测试：11 个核心（simd/gemm/int8/f16/mx/fusion + 标量回退）
+ctest --test-dir build          # 23 个测试：13 个核心（simd/gemm/int8/f16/mx/fusion/ops + 标量回退）
                                  # + 10 个组装示例自校验（attention/mla/dsa/csa/kda × 普通/标量）
 ./build/basic_gemm              # 最小示例
 ./build/benchmark               # GFLOPS / GOPS 基准
@@ -142,6 +145,30 @@ gemm(args);
 - 同格式组合 × Row/Col C 已实例化于 `src/gemm_mx.cc`；交叉格式请包含
   `cpu_ops/detail/gemm_device_defn.h` 自行实例化。
 
+### 激活 / 归一化 / TopK（ops 层）
+
+```cpp
+#include <cpu_ops/cpu_ops.h>  // 或按需包含 cpu_ops/ops/*.h
+
+cpu_ops::ops::gelu<float>(x, y, n);              // tanh 近似，f16/bf16 同签名
+cpu_ops::ops::silu<float>(x, y, n, /*threads=*/4);
+cpu_ops::ops::rmsnorm<float>(x, w, y, rows, cols, /*eps=*/1e-6f);
+cpu_ops::ops::fused_add_rmsnorm<float>(x, res, w, y, res_out, rows, cols, eps);
+// res_out = x + res；y = rmsnorm(res_out)·w——输入一遍读完（每线程 f32 行 scratch）
+cpu_ops::ops::layernorm<float>(x, w, y, rows, cols, eps);
+std::vector<int32_t> idx(k);
+cpu_ops::ops::topk_indices(scores, n, k, idx.data());
+// (值降序, 下标升序)，与 partial_sort 公式逐位一致；NaN 拒绝，k 截断到 n
+```
+
+- SIMD 数学底座（`simd::tanh/sigmoid/silu/gelu`）全部组合在 `exp2` 多项式上，
+  任意 Vec 宽度自动获得 ISA 快路径；窄存的输出走向量 RNE 转换
+  （f16 `FCVT`，bf16 整数技巧 `(u+0x7FFF+lsb)>>16`）。
+- 归一化行统计用双累加器 + 固定归约树；任务为 p×8 个连续大块
+  （`parallel_for` 一波的同步开销几十 µs，细粒度分波会被吃掉）。
+- topk 为 MSD 字节级 radix-select（-0 规范化到 +0 保平局规则），DSA 的
+  选集阶段直接调用。
+
 ### 融合 epilogue
 
 ```cpp
@@ -160,8 +187,8 @@ Fused gemm;
 gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦片还在寄存器时融合
 ```
 
-内置 op：`Relu`、`Clamp<T>`、`BiasAdd<T>`（按列）、`ScalePerRow<T>`、
-`ScalePerCol<T>`；`Chain<Ops...>` 顺序组合。op 契约是位置感知的
+内置 op：`Relu`、`Gelu`（tanh 近似）、`Silu`、`Clamp<T>`、`BiasAdd<T>`（按列）、
+`ScalePerRow<T>`、`ScalePerCol<T>`；`Chain<Ops...>` 顺序组合。op 契约是位置感知的
 `(x, row, col)` + `apply_vec` 车道形式，可自由扩展。融合 epilogue 不在静态库中
 预实例化——包含 `gemm_fused.h` 即在自己的编译单元内联整个 kernel。
 
@@ -207,6 +234,9 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `attention::DsaAttention<T>`（示例） | latent cache + indexer → 每 head 输出 | 稀疏式：indexer 打分 + 精确 top-k + CLS + 无 pack 行核 |
 | `attention::CsaAttention<T>`（示例） | latent cache（+压缩缓存）→ 每 head 输出 | 三分支：压缩/选块（top-n 块）/窗口，sigmoid 门控求和 |
 | `attention::KdaAttention<T>`（示例） | q/k/v + β/λ logits（+初始状态）→ 输出 + 终态 | 线性注意力：门控 delta 规则，naive/chunk 双模式 |
+| `ops::gelu/silu<T>` | T → T | f32 车道数学 + 向量 RNE 窄存 |
+| `ops::rmsnorm / fused_add_rmsnorm / layernorm<T>` | [rows×cols] → 同型 | 双累加器行统计，fused 输入一遍读完 |
+| `ops::topk_indices` | f32 → int32[k] | MSD radix-select，与 partial_sort 逐位同语义 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
 乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
@@ -269,6 +299,11 @@ int8（u8×s8→s32）GOPS（一个乘积累加计 2 ops）：
 | 2048³ | 179.7 | 408.4 | 821.3 | 772.6 |
 
 参照：朴素三重循环（ikj 序，编译器自动向量化）单线程 512³ 约 30–46 GFLOPS。
+
+ops 层（M1 Pro，4T，8192×7168 / 64M 元素）：rmsnorm 4.86 ms vs 朴素 62.7 ms
+（**12.9×**，~145 GB/s）；fused_add_rmsnorm 12.4 ms（~76 GB/s）；silu f32
+53 GB/s（vs 朴素 11.9×）、bf16 20 GB/s（向量 RNE 窄存后 2.5×）；topk
+n=64k/k=2048 467 µs（vs partial_sort 1.3×，更大 n 优势扩大）。
 
 Fused attention（Apple M1 Pro，4T，H=16 d=128 causal f32）：seq 512/1024/2048
 分别 109 / 144 / 181 GFLOPS——约为同机纯 f32 GEMM 吞吐的 74%；bf16 操作数再快
@@ -376,6 +411,11 @@ include/cpu_ops/
 ├── layout.h                         # RowMajor / ColumnMajor / TensorRef
 ├── element_types.h                  # float16_t / bfloat16_t
 ├── mx_formats.h                     # fp8e4m3_t / fp8e5m2_t / fp4e2m1_t / E8M0 / MxTensorRef
+├── ops/                             # 算子原语层（实例化于 src/ops.cc）
+│   ├── activation.h                 # gelu/silu（f32 车道 + 向量窄存）
+│   ├── norm.h                       # rmsnorm / fused add+rmsnorm / layernorm
+│   ├── topk.h                       # MSD radix-select 精确 top-k
+│   └── detail/parallel.h            # p×8 连续大块的任务切分
 ├── status.h                         # Status 枚举
 ├── epilogue/
 │   ├── linear_combination.h         # LinearCombination (alpha/beta/ReLU)
@@ -406,6 +446,7 @@ src/
 ├── gemm_vnni.cc                     # u8×s8→s32 × 8
 ├── gemm_f16.cc / gemm_bf16.cc       # f16/bf16 → f32 × 8
 ├── gemm_mx.cc                       # MX 同格式组合 × Row/Col C
+├── ops.cc                           # activation/norm × f32/f16/bf16 显式实例化
 └── gemm_sme_f32.cc                  # SME f32 × 8（非 SME 编译时为空）
 examples/
 ├── 00_basic_gemm.cc                 # 最小 GEMM 示例

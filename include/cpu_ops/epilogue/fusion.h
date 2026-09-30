@@ -38,6 +38,45 @@ struct Relu {
   }
 };
 
+// x -> gelu(x), tanh approximation (matches ops::gelu):
+//   0.5x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+struct Gelu {
+  template <typename T>
+  T operator()(T x, int /*row*/, int /*col*/) const {
+    const double inner = 0.7978845608028654 *
+                         ((double)x + 0.044715 * (double)x * (double)x * (double)x);
+    return T(0.5 * ((double)x * (1.0 + std::tanh(inner))));
+  }
+  template <typename U, int N>
+  simd::Vec<U, N> apply_vec(simd::Vec<U, N> x, int /*row*/, int /*col*/) const {
+    if constexpr (std::is_same<U, float>::value) {
+      return simd::gelu(x);
+    } else {
+      simd::Vec<U, N> r;
+      for (int i = 0; i < N; ++i) r.v[i] = (*this)(x.v[i], 0, 0);
+      return r;
+    }
+  }
+};
+
+// x -> silu(x) = x * sigmoid(x)
+struct Silu {
+  template <typename T>
+  T operator()(T x, int /*row*/, int /*col*/) const {
+    return T((double)x / (1.0 + std::exp(-(double)x)));
+  }
+  template <typename U, int N>
+  simd::Vec<U, N> apply_vec(simd::Vec<U, N> x, int /*row*/, int /*col*/) const {
+    if constexpr (std::is_same<U, float>::value) {
+      return simd::silu(x);
+    } else {
+      simd::Vec<U, N> r;
+      for (int i = 0; i < N; ++i) r.v[i] = (*this)(x.v[i], 0, 0);
+      return r;
+    }
+  }
+};
+
 // x -> min(max(x, lo), hi)
 template <typename T>
 struct Clamp {
