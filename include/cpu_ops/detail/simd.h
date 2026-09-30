@@ -22,6 +22,7 @@
 #include <arm_neon.h>
 #endif
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -113,6 +114,38 @@ inline Vec<int32_t, N> dpbusd(Vec<int32_t, N> acc, Vec<int32_t, N> a, Vec<int32_
   return acc;
 }
 
+// ---- Softmax helpers (f32 lanes) -----------------------------------------
+// The generic implementations round-trip through a stack array so they work
+// for every Vec flavor (scalar fallback and SVE included); AVX2 and NEON
+// override exp2/hmax/hsum below. hsum uses a fixed lane order so summation
+// results are bit-stable for a given build.
+
+template <int N>
+inline Vec<float, N> exp2(Vec<float, N> x) {
+  float t[N];
+  x.store(t);
+  for (int i = 0; i < N; ++i) t[i] = std::exp2f(t[i]);
+  return Vec<float, N>::load(t);
+}
+
+template <int N>
+inline float hmax(const Vec<float, N>& x) {
+  float t[N];
+  x.store(t);
+  float m = t[0];
+  for (int i = 1; i < N; ++i) m = m < t[i] ? t[i] : m;
+  return m;
+}
+
+template <int N>
+inline float hsum(const Vec<float, N>& x) {
+  float t[N];
+  x.store(t);
+  float s = t[0];
+  for (int i = 1; i < N; ++i) s += t[i];
+  return s;
+}
+
 #if defined(CPU_OPS_SIMD_AVX2)
 
 template <>
@@ -141,6 +174,47 @@ inline Vec<float, 8> max(const Vec<float, 8>& a, const Vec<float, 8>& b) {
 }
 inline Vec<float, 8> min(const Vec<float, 8>& a, const Vec<float, 8>& b) {
   return _mm256_min_ps(a.v, b.v);
+}
+
+// exp2: round-to-nearest integer exponent (magic-add trick) + degree-6
+// minimax polynomial for 2^r on [-0.5, 0.5], relative error ~1e-7. Inputs are
+// clamped so extreme arguments flush to ~0 / +inf instead of corrupting the
+// exponent-bit reconstruction.
+template <>
+inline Vec<float, 8> exp2(Vec<float, 8> x) {
+  const __m256 xc = _mm256_min_ps(_mm256_max_ps(x.v, _mm256_set1_ps(-126.0f)),
+                                  _mm256_set1_ps(128.0f));
+  const __m256 magic = _mm256_set1_ps(12582912.0f);  // 1.5 * 2^23
+  const __m256 n = _mm256_sub_ps(_mm256_add_ps(xc, magic), magic);
+  const __m256 r = _mm256_sub_ps(xc, n);  // [-0.5, 0.5]
+  __m256 p = _mm256_set1_ps(0.00015309011f);
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.0013397580f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.0096181291f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.0555041100f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.2402265100f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.6931471800f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+  const __m256i e =
+      _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+  return _mm256_mul_ps(p, _mm256_castsi256_ps(e));
+}
+
+// Fixed reduction trees: identical order on every call, so hsum results are
+// bit-stable across threads and runs.
+template <>
+inline float hmax(const Vec<float, 8>& x) {
+  __m128 m = _mm_max_ps(_mm256_castps256_ps128(x.v), _mm256_extractf128_ps(x.v, 1));
+  m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+  m = _mm_max_ps(m, _mm_shuffle_ps(m, m, _MM_SHUFFLE(1, 1, 1, 1)));
+  return _mm_cvtss_f32(m);
+}
+
+template <>
+inline float hsum(const Vec<float, 8>& x) {
+  __m128 s = _mm_add_ps(_mm256_castps256_ps128(x.v), _mm256_extractf128_ps(x.v, 1));
+  s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+  s = _mm_add_ps(s, _mm_shuffle_ps(s, s, _MM_SHUFFLE(1, 1, 1, 1)));
+  return _mm_cvtss_f32(s);
 }
 
 template <>
@@ -317,6 +391,37 @@ inline Vec<float, 4> max(const Vec<float, 4>& a, const Vec<float, 4>& b) {
 inline Vec<float, 4> min(const Vec<float, 4>& a, const Vec<float, 4>& b) {
   return vminq_f32(a.v, b.v);
 }
+
+// exp2, same scheme as the AVX2 version (round-to-nearest-even exponent via
+// vcvtnq + degree-6 polynomial on [-0.5, 0.5], inputs clamped).
+template <>
+inline Vec<float, 4> exp2(Vec<float, 4> x) {
+  const float32x4_t xc =
+      vminq_f32(vmaxq_f32(x.v, vdupq_n_f32(-126.0f)), vdupq_n_f32(128.0f));
+  const int32x4_t ni = vcvtnq_s32_f32(xc);
+  const float32x4_t n = vcvtq_f32_s32(ni);
+  const float32x4_t r = vsubq_f32(xc, n);  // [-0.5, 0.5]
+  float32x4_t p = vdupq_n_f32(0.00015309011f);
+  p = vfmaq_f32(vdupq_n_f32(0.0013397580f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(0.0096181291f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(0.0555041100f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(0.2402265100f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(0.6931471800f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+  const int32x4_t e = vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23);
+  return vmulq_f32(p, vreinterpretq_f32_s32(e));
+}
+
+#if defined(__aarch64__)
+template <>
+inline float hmax(const Vec<float, 4>& x) {
+  return vmaxvq_f32(x.v);
+}
+template <>
+inline float hsum(const Vec<float, 4>& x) {
+  return vaddvq_f32(x.v);
+}
+#endif  // __aarch64__
 
 #endif  // CPU_OPS_SIMD_NEON
 

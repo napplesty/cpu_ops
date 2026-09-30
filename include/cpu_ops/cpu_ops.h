@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cpu_ops/attention/attention.h"
 #include "cpu_ops/element_types.h"
 #include "cpu_ops/epilogue/fusion.h"
 #include "cpu_ops/epilogue/linear_combination.h"

@@ -19,6 +19,7 @@ set(CPU_OPS_SOURCES
   src/gemm_vnni.cc
   src/gemm_mx.cc
   src/gemm_sme_f32.cc
+  src/attention.cc
   src/thread_pool.cc
   src/thread_swizzle.cc)
 
@@ -41,6 +42,9 @@ if(CPU_OPS_BUILD_EXAMPLES)
 
   add_executable(benchmark examples/01_benchmark.cc)
   target_link_libraries(benchmark PRIVATE cpu_ops cpu_ops_build_flags)
+
+  add_executable(attention_demo examples/02_attention.cc)
+  target_link_libraries(attention_demo PRIVATE cpu_ops cpu_ops_build_flags)
 endif()
 
 if(CPU_OPS_BUILD_TESTS)
@@ -64,6 +68,9 @@ if(CPU_OPS_BUILD_TESTS)
   add_executable(test_fusion test/test_fusion.cc)
   target_link_libraries(test_fusion PRIVATE cpu_ops cpu_ops_build_flags)
 
+  add_executable(test_attention test/test_attention.cc)
+  target_link_libraries(test_attention PRIVATE cpu_ops cpu_ops_build_flags)
+
   # Same suites against the portable scalar fallback (no SIMD intrinsics):
   # each pairs a test file with the library sources compiled with
   # CPU_OPS_FORCE_SCALAR.
@@ -79,6 +86,7 @@ if(CPU_OPS_BUILD_TESTS)
   add_scalar_test(test_gemm_int8_scalar test/test_gemm_int8.cc)
   add_scalar_test(test_gemm_f16_scalar test/test_gemm_f16.cc)
   add_scalar_test(test_gemm_mx_scalar test/test_gemm_mx.cc)
+  add_scalar_test(test_attention_scalar test/test_attention.cc)
 
   add_test(NAME simd COMMAND test_simd)
   add_test(NAME gemm COMMAND test_gemm)
@@ -86,9 +94,11 @@ if(CPU_OPS_BUILD_TESTS)
   add_test(NAME gemm_f16 COMMAND test_gemm_f16)
   add_test(NAME gemm_mx COMMAND test_gemm_mx)
   add_test(NAME fusion COMMAND test_fusion)
+  add_test(NAME attention COMMAND test_attention)
   add_test(NAME fusion_scalar COMMAND test_fusion_scalar)
   add_test(NAME gemm_scalar COMMAND test_gemm_scalar)
   add_test(NAME gemm_int8_scalar COMMAND test_gemm_int8_scalar)
   add_test(NAME gemm_f16_scalar COMMAND test_gemm_f16_scalar)
   add_test(NAME gemm_mx_scalar COMMAND test_gemm_mx_scalar)
+  add_test(NAME attention_scalar COMMAND test_attention_scalar)
 endif()

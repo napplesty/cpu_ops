@@ -7,6 +7,7 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 - int8 量化 GEMM（u8×s8→s32）：AVX-VNNI 点积指令
 - f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
+- Fused attention：GQA / MHA / MQA，online softmax 单遍融合，causal 块跳过，decode 自动 KV-split
 - Split-K：深 k 自动切分 + 确定性两阶段归约
 - 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
 - ARM 支持：NEON / SVE2 定长 / SME（实验性）
@@ -16,7 +17,7 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 
 ```bash
 cmake -B build && cmake --build build -j
-ctest --test-dir build          # 11 个测试：simd / gemm / int8 / f16 / mx / fusion + 标量回退
+ctest --test-dir build          # 13 个测试：simd / gemm / int8 / f16 / mx / fusion / attention + 标量回退
 ./build/basic_gemm              # 最小示例
 ./build/benchmark               # GFLOPS / GOPS 基准
 ```
@@ -127,6 +128,38 @@ gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦�
 `(x, row, col)` + `apply_vec` 车道形式，可自由扩展。融合 epilogue 不在静态库中
 预实例化——包含 `gemm_fused.h` 即在自己的编译单元内联整个 kernel。
 
+### Attention（GQA / MHA / MQA）
+
+```cpp
+using Attn = cpu_ops::attention::Attention<float>;  // 或 float16_t / bfloat16_t
+
+// Q: [b][h_q][seq_q][d]，K/V: [b][h_kv][seq_kv][d]，O 同 Q；d 连续，其余按元素步长。
+// MHA: heads_kv == heads_q；MQA: heads_kv == 1；GQA: heads_kv 整除 heads_q
+//（query 头 h 看 KV 头 h*heads_kv/heads_q）。
+Attn::Arguments args;
+args.batch = 1;   args.heads_q = 32;  args.heads_kv = 8;   // GQA-4
+args.seq_q = 1;   args.seq_kv = 4096; args.dim = 128;
+args.q = q;  args.q_stride_b = /*...*/; args.q_stride_h = /*...*/; args.q_ld = 128;
+/* k / v / o 同构，heads_kv 个头 */
+args.scale = 0.0884f;                 // 通常 1/sqrt(dim)
+args.causal = true;                   // query i 看 kv j <= i + (seq_kv - seq_q)
+args.split_kv_slices = 0;             // 0 = 自动（decode 时切 KV 换并行），1 = 关，>1 = 强制
+
+Attn attn;
+attn(args);                            // 线程数参数同 GEMM
+```
+
+- S = Q·Kᵀ、softmax、O += P·V 融合在一个块内核里：S/P 只在 L1 内存在，
+  不落地到内存；Q 面板打包一次跨整个 KV 循环复用。
+- causal 掩码按块判断：整块越界的直接跳过（方阵问题省 ~50% FLOPs），
+  边界块按行截断。
+- f16 / bf16 操作数在打包时转 f32，softmax 与累加全程 f32；KV cache 用
+  bf16/f16 存储可直接减半 decode 带宽。
+- 确定性与 GEMM 同一套契约：kv-split 关闭时单/多线程**逐位一致**；
+  开启时按固定 slice 顺序归并，跨运行**逐位一致**。
+- 深入稀疏 / 线性变体（CSA、KDA、DSA）的扩展缝（kv 迭代、块准入谓词、
+  权重变换）见 `attention/attention.h` 头注释。
+
 ### 通用说明
 
 - f32/f64 与 int8 各自的 A/B/C 八种 RowMajor/ColumnMajor 组合均已实例化。
@@ -146,6 +179,7 @@ gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦�
 | `GemmU8S8S32` | u8×s8 → s32 | VNNI `vpdpbusd`（4 路字节点积） |
 | `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32，走 f32 FMA |
 | `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA |
+| `attention::Attention<T>` | f32/f16/bf16 → 同型 | QKᵀ + online softmax + PV 融合，f32 累加 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
 乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
@@ -209,11 +243,19 @@ int8（u8×s8→s32）GOPS（一个乘积累加计 2 ops）：
 
 参照：朴素三重循环（ikj 序，编译器自动向量化）单线程 512³ 约 30–46 GFLOPS。
 
+Fused attention（Apple M1 Pro，4T，H=16 d=128 causal f32）：seq 512/1024/2048
+分别 109 / 144 / 181 GFLOPS——约为同机纯 f32 GEMM 吞吐的 74%；bf16 操作数再快
+~3%。decode（seq_q=1）目前走通用面板路径，KV 有效带宽 ~4.6 GB/s，专用小 M
+内核是后续工作。
+
 ### 已知限制
 
 - GEMV 无专用 kernel，单线程 GEMV 约为 OpenBLAS 的 0.5x。
 - 单线程 kernel 相对 OpenBLAS 有 0.82–0.92x 的差距，来自微内核调优深度。
 - ARM 路径（NEON / SVE2 / SME）尚未在大规模部署中验证，SME 为实验性。
+- Attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低；专用
+  小 M 内核待做。稀疏 / 线性变体（CSA / KDA / DSA）尚未实现，扩展缝见
+  `attention/attention.h`。
 
 ## 架构
 
@@ -276,7 +318,10 @@ include/cpu_ops/
 │   ├── gemm.h                       # device::Gemm 声明、GemmConfig、U8S8S32/F16/BF16 别名
 │   ├── gemm_fused.h                 # GemmFusedF32/F64（头文件实例化路径）
 │   └── gemm_mx.h                    # device::GemmMx 声明、E4M3/E5M2/E2M1 别名
+├── attention/
+│   └── attention.h                  # Attention<T>（GQA/MHA/MQA）+ CSA/KDA/DSA 路线注释
 └── detail/                          # 内部实现（模板机制）
+    ├── attention_kernel.h           # fused 块内核：Q 驻留 + online softmax + P·V
     ├── simd.h                       # ISA 检测 + simd::Vec（AVX2/VNNI/SVE/NEON/标量）
     ├── mma_atom.h                   # FMA 寄存器微内核
     ├── mma_policy_fma.h             # f32/f64 policy
@@ -297,8 +342,9 @@ src/
 ├── gemm_vnni.cc                     # u8×s8→s32 × 8
 ├── gemm_f16.cc / gemm_bf16.cc       # f16/bf16 → f32 × 8
 ├── gemm_mx.cc                       # MX 同格式组合 × Row/Col C
+├── attention.cc                     # Attention<f32/f16/bf16> 实例化
 └── gemm_sme_f32.cc                  # SME f32 × 8（非 SME 编译时为空）
-examples/  00_basic_gemm.cc  01_benchmark.cc
+examples/  00_basic_gemm.cc  01_benchmark.cc  02_attention.cc
 test/      test_simd.cc  test_gemm.cc  test_gemm_int8.cc  test_gemm_f16.cc
-           test_gemm_mx.cc  test_fusion.cc
+           test_gemm_mx.cc  test_fusion.cc  test_attention.cc
 ```
