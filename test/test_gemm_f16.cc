@@ -246,6 +246,11 @@ void check_splitk(int num_threads) {
 }  // namespace
 
 int main() {
+  // Block scope keeps the names out of global lookup, where ARM's arm_bf16.h
+  // typedefs a conflicting ::bfloat16_t.
+  using cpu_ops::bfloat16_t;
+  using cpu_ops::float16_t;
+
   check_f16_conversions();
   check_bf16_conversions();
 

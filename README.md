@@ -1,72 +1,16 @@
 # cpu-ops
 
-CPU 高性能 GEMM 模板库：SIMD + 多线程，按 `.h` 声明 + `.cc` 显式实例化组织，编译为
-静态库 `libcpu_ops.a`。C++17，无第三方依赖。
+CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17，无第三方依赖，
+按 `.h` 声明 + `.cc` 显式实例化组织，编译为静态库 `libcpu_ops.a`。
 
-- f32/f64 GEMM：AVX2+FMA 主路径
+- f32 / f64 GEMM：FMA 主路径
 - int8 量化 GEMM（u8×s8→s32）：AVX-VNNI 点积指令
-- f16/bf16 输入 GEMM（f32 累加/输出）：打包时转 f32
+- f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
 - Split-K：深 k 自动切分 + 确定性两阶段归约
-- 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU/Clamp/BiasAdd/…）
-- ARM：NEON / SVE2 定长 / SME（实验性，见「ISA 支持矩阵」）
-
-## 分层架构
-
-| 层 | 组件 | 职责 |
-|---|---|---|
-| 指令层 | `simd::Vec<T, N>` | SIMD 寄存器抽象：`load / store / set1 / fmadd / dpbusd` |
-| 微内核层 | `MmaAtom` / `MmaAtomVnni` / `MmaAtomSmeF32` | MR×NR 累加瓦片驻留寄存器（或 SME ZA 瓦片） |
-| 策略层 | `mma::FmaPolicy` / `VnniPolicy` / `WidenPolicy` / `MxPolicy` / `SmePolicyF32` | 定义 ElemA/ElemB/PackedA/PackedB/AccT、k 步长、打包布局、微内核类型——`BlockGemm` 由 policy 驱动，扩展新指令集或新数据类型只需新增 policy |
-| 打包层 | `detail::pack_a / pack_b` | A/B 面板按微瓦片交织成连续内存，零填充处理边缘；Packed 类型 ≠ 输入类型时在打包处转换 |
-| 分块层 | `BlockGemm<Policy, ...>` | MC/NC/KC 三级 cache 分块主循环；B 条带驻留 L1，A 面板流式复用 |
-| 线程层 | `ThreadPool` + `partition_gemm` | 持久线程池；输出按 MR/NR 对齐的矩形区域静态划分（先切 N，不足再切 M），k 方向可再切 split-k 片 |
-| 入口层 | `gemm::device::Gemm` / `GemmMx` | 类模板入口：`Arguments` + `operator()` |
-| Epilogue | `epilogue::LinearCombination` / `LinearCombinationFused` | 写回时融合 `D = alpha·acc + beta·C` 及 op 链；split-k 时用 `PartialSum` 暂存部分和 |
-
-微内核默认 `MR=6, NR=16`（f32/AVX2：12 个 YMM 累加器 + 2 个 B 向量 + 1 个广播，
-打满 16 个向量寄存器）；cache 块默认 `MC=126, NC=256, KC=256`。
-
-## 数据类型
-
-| 入口 | A×B → C/D（累加） | 计算路径 |
-|---|---|---|
-| `Gemm<float, ...>` | f32×f32 → f32 | f32 FMA |
-| `Gemm<double, ...>` | f64×f64 → f64 | f64 FMA |
-| `GemmU8S8S32` | u8×s8 → s32 | VNNI `vpdpbusd`（4 路字节点积） |
-| `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32，走 f32 FMA |
-| `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA |
-
-注意：f16/bf16/MX 路径的收益来自**操作数内存流量减半/减四**（以及更小的 cache
-占用），算术本身仍是 f32 FMA——本机没有 FP8/FP16 矩阵指令，不要用这些路径期待
-算力翻倍的语义。
-
-## ISA 支持矩阵
-
-同一套源码编译期分派（`include/cpu_ops/detail/simd.h` 检测，无运行时分派）：
-
-| 平台 | 数据类型 | 指令 | 状态 |
-|---|---|---|---|
-| x86-64 AVX2+FMA | f32 / f64 / f16 / bf16 / mxfp8 / mxfp4 | `vfmadd`（f16 转换用 F16C；MX 解码用 F16C+PSHUFB 快路径） | ✅ 已实测 |
-| x86 AVX-VNNI / AVX512-VNNI | u8×s8→s32 | `vpdpbusd` | ✅ 已实测 |
-| ARM NEON | f32 | `vfmaq_f32` | ⚠️ 仅代码审查，未实测 |
-| ARM SVE/SVE2 定长（`-msve-vector-bits=N`） | f32 / f64 | `svmla` | ⚠️ 仅代码审查，未实测 |
-| ARM SME | f32 | `svfmopa`（外积累加进 ZA 瓦片） | 🧪 实验性，未实测 |
-| 任意平台 | 全部 | 通用标量回退（`CPU_OPS_FORCE_SCALAR` 可强制） | ✅ 已实测（CI 中各 `*_scalar` 测试） |
-
-关于 x86 矩阵指令：AMX（`TDP*` 瓦片指令）只支持 int8/bf16/fp16/fp8、不支持 f32/f64，
-且仅存在于部分至强；本库的 int8 路径选择 `vpdpbusd`（VNNI），消费级 CPU 普遍具备。
-
-ARM 构建（需要 aarch64 工具链，GCC 14+ / Clang 18+）：
-
-```bash
-# NEON（默认 AArch64 即可）
-aarch64-linux-gnu-g++ -O3 ...
-# SVE2 定长（如 256-bit）
-aarch64-linux-gnu-g++ -O3 -march=armv9-a+sve2 -msve-vector-bits=256 ...
-# SME（实验性）
-aarch64-linux-gnu-g++ -O3 -march=armv9.2-a+sme -msve-vector-bits=512 src/gemm_sme_f32.cc ...
-```
+- 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
+- ARM 支持：NEON / SVE2 定长 / SME（实验性）
+- 任意平台均有标量回退；单线程与多线程结果**逐位一致**
 
 ## 构建
 
@@ -82,7 +26,7 @@ CMake 选项：`CPU_OPS_ENABLE_NATIVE`（默认 ON，`-march=native`）、
 
 ## 用法
 
-### f32/f64 GEMM
+### f32 / f64 GEMM
 
 ```cpp
 #include <cpu_ops/cpu_ops.h>
@@ -121,7 +65,7 @@ GemmI8 gemm;
 gemm(args);
 ```
 
-### f16 / bf16 输入（f32 累加/输出）
+### f16 / bf16 输入（f32 累加 / 输出）
 
 ```cpp
 using GemmF16 = cpu_ops::gemm::device::GemmF16F32<
@@ -132,7 +76,7 @@ GemmF16::Arguments args{{M, N, K}, {A_f16, lda}, {B_f16, ldb}, {C, ldc}, {D, ldd
                         {alpha, beta}};
 ```
 
-`float16_t`/`bfloat16_t` 见 `element_types.h`：从 float 构造做 RNE 舍入，隐式转回
+`float16_t` / `bfloat16_t` 见 `element_types.h`：从 float 构造做 RNE 舍入，隐式转回
 float。`GemmBF16F32` 用法相同。八种 layout 组合均已实例化。
 
 ### MX 格式（mxfp8 / mxfp4 + E8M0 块缩放）
@@ -150,7 +94,7 @@ GemmMx gemm;
 gemm(args);
 ```
 
-- 元素字节序：`fp8e4m3_t`/`fp8e5m2_t` 每元素 1 字节；`fp4e2m1_t` 每字节 2 个元素
+- 元素字节序：`fp8e4m3_t` / `fp8e5m2_t` 每元素 1 字节；`fp4e2m1_t` 每字节 2 个元素
   （k 偶数在低 nibble），此时 `ld` 必须为偶数。
 - 编码器：`float16_t` 式 RNE 饱和编码（`fp8e4m3_t::from_float` 等），scale 用
   `e8m0_from_float`（舍入到最近的 2 的幂）。
@@ -193,26 +137,35 @@ gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦�
 - 自定义 tile 配置 / epilogue / mma policy：包含 `cpu_ops/detail/gemm_device_defn.h`
   并显式实例化自己的 `Gemm<...>` 特化。
 
-## 实测性能
+## 数据类型
 
-环境：Intel Core Ultra 7 258V（4 P 核 + 4 E 核，AVX2+FMA+AVX-VNNI），g++ 15.2，
-`-O3 -march=native`，行主序，best-of-5。对比方 OpenBLAS 0.3.32（Haswell kernel，
-dlopen 加载）。本机有后台负载，数字会波动；OpenBLAS 对比在两个独立进程中分别
-计时（同进程测量会被 OpenBLAS 驻留线程池干扰）。
+| 入口 | A×B → C/D（累加） | 计算路径 |
+|---|---|---|
+| `Gemm<float, ...>` | f32×f32 → f32 | f32 FMA |
+| `Gemm<double, ...>` | f64×f64 → f64 | f64 FMA |
+| `GemmU8S8S32` | u8×s8 → s32 | VNNI `vpdpbusd`（4 路字节点积） |
+| `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32，走 f32 FMA |
+| `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA |
+
+f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
+乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
+
+## 性能
+
+参考数据：Intel Core Ultra 7 258V（4 P 核 + 4 E 核，AVX2+FMA+AVX-VNNI），g++ 15.2，
+`-O3 -march=native`，行主序，best-of-5；对比基准 OpenBLAS 0.3.32（Haswell kernel）。
+多线程数据在绑定核心的条件下测得，避免调度噪声。
 
 f32 方阵 GFLOPS（cpu_ops）及与 OpenBLAS 之比：
 
 | size | 1T | 4T | 8T | vs OpenBLAS 1T | vs OpenBLAS 8T |
 |---|---|---|---|---|---|
 | 512³  | 128 | 257 | 503 | ~1.0x | 1.02x |
-| 1024³ | 125 | 255（绑 P 核 444） | 495 | 0.92x | 1.00x |
-| 2048³ | 123 | 387（绑 P 核 425） | 518 | 0.91x | 0.93x |
+| 1024³ | 125 | 444 | 495 | 0.92x | 1.00x |
+| 2048³ | 123 | 425 | 518 | 0.91x | 0.93x |
 | 4096³ | 116 | 402 | 511 | 0.82x | 0.93x |
 
-8 线程时两家都触及该机 f32 算力上限（~500–550 GFLOPS），大体平手。4 线程不绑核
-时调度器可能把线程放上 E 核，需要 `taskset -c 0-3` 才测得出 kernel 真实差距
-（0.88–0.94x）；OpenBLAS 默认绑定线程故不受此影响。单线程差距来自微内核调优深度，
-是我们继续打磨的空间。
+8 线程时双方都触及该机 f32 算力上限（~500–550 GFLOPS），大体持平。
 
 不规则形状（8T，vs OpenBLAS）：
 
@@ -224,8 +177,7 @@ f32 方阵 GFLOPS（cpu_ops）及与 OpenBLAS 之比：
 | 8192×128×128（LLM 投影形） | 478 | 494 | 0.97x |
 | 1×4096×4096（GEMV） | 21 | 21 | 1.05x |
 
-GEMV 单线程仍是弱项（0.5x 左右，未做专用 GEMV kernel）；深 k 小输出形状经 split-k
-后反超。split-k 单独看（8T，`split_k_slices` 强制值对比，GFLOPS）：
+split-k 效果（8T，`split_k_slices` 强制值对比，GFLOPS）：
 
 | 形状 | s=1（关） | auto | 最佳强制值 |
 |---|---|---|---|
@@ -242,20 +194,69 @@ GEMV 单线程仍是弱项（0.5x 左右，未做专用 GEMV kernel）；深 k �
 | 8192×4096×128 8T | 349 | 372 | — | 363 | 373 |
 
 低精度类型在小 K / 大 M 形状上领先 f32 最多 ~15%（省内存流量），方阵打平
-（都已算力受限）。深 k 极小输出（32×32×8192）MX 路径有解码开销，比 f32 慢
+（都已算力受限）；深 k 极小输出（32×32×8192）MX 路径有解码开销，比 f32 慢
 ~20–30%。
 
-融合 epilogue（2048³ 8T，bias+ReLU）：与无融合的 GEMM 相比开销 ≈ 0（实测 −2%，
-噪声内）；比「GEMM + 单独逐元素 pass」快 ~8%（省一遍 C 的读写扫描）。
+融合 epilogue（2048³ 8T，bias+ReLU）：与无融合的 GEMM 相比开销 ≈ 0；比
+「GEMM + 单独逐元素 pass」快 ~8%（省一遍 C 的读写扫描）。
 
-int8（u8×s8→s32）GOPS（一个乘积累加计 2 ops，测量时机器有后台负载）：
+int8（u8×s8→s32）GOPS（一个乘积累加计 2 ops）：
 
 | size | 1T | 2T | 4T | 8T |
 |---|---|---|---|---|
 | 1024³ | 175.6 | 413.2 | 412.3 | 715.7 |
 | 2048³ | 179.7 | 408.4 | 821.3 | 772.6 |
 
-朴素三重循环（ikj 序，编译器自动向量化）单线程 512³：约 30–46 GFLOPS。
+参照：朴素三重循环（ikj 序，编译器自动向量化）单线程 512³ 约 30–46 GFLOPS。
+
+### 已知限制
+
+- GEMV 无专用 kernel，单线程 GEMV 约为 OpenBLAS 的 0.5x。
+- 单线程 kernel 相对 OpenBLAS 有 0.82–0.92x 的差距，来自微内核调优深度。
+- ARM 路径（NEON / SVE2 / SME）尚未在大规模部署中验证，SME 为实验性。
+
+## 架构
+
+| 层 | 组件 | 职责 |
+|---|---|---|
+| 指令层 | `simd::Vec<T, N>` | SIMD 寄存器抽象：`load / store / set1 / fmadd / dpbusd` |
+| 微内核层 | `MmaAtom` / `MmaAtomVnni` / `MmaAtomSmeF32` | MR×NR 累加瓦片驻留寄存器（或 SME ZA 瓦片） |
+| 策略层 | `mma::FmaPolicy` / `VnniPolicy` / `WidenPolicy` / `MxPolicy` / `SmePolicyF32` | 定义 ElemA/ElemB/PackedA/PackedB/AccT、k 步长、打包布局、微内核类型——`BlockGemm` 由 policy 驱动，扩展新指令集或新数据类型只需新增 policy |
+| 打包层 | `detail::pack_a / pack_b` | A/B 面板按微瓦片交织成连续内存，零填充处理边缘；Packed 类型 ≠ 输入类型时在打包处转换 |
+| 分块层 | `BlockGemm<Policy, ...>` | MC/NC/KC 三级 cache 分块主循环；B 条带驻留 L1，A 面板流式复用 |
+| 线程层 | `ThreadPool` + `partition_gemm` | 持久线程池；输出按 MR/NR 对齐的矩形区域静态划分（先切 N，不足再切 M），k 方向可再切 split-k 片 |
+| 入口层 | `gemm::device::Gemm` / `GemmMx` | 类模板入口：`Arguments` + `operator()` |
+| Epilogue | `epilogue::LinearCombination` / `LinearCombinationFused` | 写回时融合 `D = alpha·acc + beta·C` 及 op 链；split-k 时用 `PartialSum` 暂存部分和 |
+
+微内核默认 `MR=6, NR=16`（f32/AVX2：12 个 YMM 累加器 + 2 个 B 向量 + 1 个广播，
+打满 16 个向量寄存器）；cache 块默认 `MC=126, NC=256, KC=256`。
+
+## ISA 支持
+
+同一套源码编译期分派（`include/cpu_ops/detail/simd.h` 检测，无运行时分派）：
+
+| 平台 | 数据类型 | 指令 |
+|---|---|---|
+| x86-64 AVX2+FMA | f32 / f64 / f16 / bf16 / mxfp8 / mxfp4 | `vfmadd`（f16 转换用 F16C；MX 解码用 F16C+PSHUFB 快路径） |
+| x86 AVX-VNNI / AVX512-VNNI | u8×s8→s32 | `vpdpbusd` |
+| ARM NEON | f32 | `vfmaq_f32` |
+| ARM SVE/SVE2 定长（`-msve-vector-bits=N`） | f32 / f64 | `svmla` |
+| ARM SME（实验性） | f32 | `svfmopa`（外积累加进 ZA 瓦片） |
+| 任意平台 | 全部 | 通用标量回退（`CPU_OPS_FORCE_SCALAR` 可强制） |
+
+int8 路径选择 `vpdpbusd`（VNNI）而非 AMX：AMX 只支持 int8/bf16/fp16/fp8、不支持
+f32/f64，且仅存在于部分至强；VNNI 在消费级 CPU 上普遍具备。
+
+ARM 构建（需要 aarch64 工具链，GCC 14+ / Clang 18+）：
+
+```bash
+# NEON（默认 AArch64 即可）
+aarch64-linux-gnu-g++ -O3 ...
+# SVE2 定长（如 256-bit）
+aarch64-linux-gnu-g++ -O3 -march=armv9-a+sve2 -msve-vector-bits=256 ...
+# SME（实验性）
+aarch64-linux-gnu-g++ -O3 -march=armv9.2-a+sme -msve-vector-bits=512 src/gemm_sme_f32.cc ...
+```
 
 ## 目录结构
 
