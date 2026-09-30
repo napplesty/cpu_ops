@@ -68,15 +68,17 @@ decode（seq_q=1，causal，对同形稠密 MLA）：
 
 | kv len | MLA 4T ms | DSA 1T ms | DSA 4T ms | 加速比 | 有效 GB/s |
 |---|---|---|---|---|---|
-| 8192 | 31.2 | 26.5 | 8.8 | 3.6x | 17.6 |
-| 32768 | 115.4 | 53.7 | 17.1 | 6.7x | 34.2 |
-| 65536 | 227.6 | 91.1 | 27.5 | 8.3x | 42.1 |
+| 8192 | 30.2 | 12.9 | 5.2 | 5.8x | 29.7 |
+| 32768 | 117.5 | 29.6 | 10.6 | 11.1x | 55.5 |
+| 65536 | 228.8 | 50.9 | 17.3 | 13.3x | 67.2 |
 
-prefill（chunked continuation 512×8192）：MLA 4T 1132 ms，DSA 4T 3344 ms
-（0.34×）。decode 是 DSA 的主战场——每 token 触达从整条 cache 降到
+prefill（chunked continuation 512×8192）：MLA 4T 1159 ms，DSA 4T 1947 ms
+（0.60×）。decode 是 DSA 的主战场——每 token 触达从整条 cache 降到
 indexer key 流（64×128×2B/token）+ 一次 CLS 扫描 + (k+1) 行 gather，全部
-无 pack 顺流，64k 上下文 8.3×（indexer 按 8 头分块后 k_idx 只扫 8 遍，
-窄存→f32 走 `simd::widen_f16/widen_bf16` 向量宽化）。prefill 慢于稠密是当前实现的真实写照：
+无 pack 顺流，64k 上下文 13.3×、有效 67 GB/s（indexer 按 8 头分块后 k_idx
+只扫 8 遍；窄存→f32 走 `simd::widen_f16/widen_bf16`；dot_f32 四累加器展开
+打破 fma 单链延迟——工作集扫描显示行核从 L1 到 DRAM 全程 ~12.6 GB/s 平坦
+（指令吞吐受限，非缓存受限），展开后单核 40–52 GB/s）。prefill 慢于稠密是当前实现的真实写照：
 逐行精确选集使注意力只能以 M=1 行核算力执行（选中率 26% 省下的 FLOP
 补不回行核与 GEMM 核的算力差），且窄存→f32 是逐元素软件转换——面板共享
 选集重回 GEMM 核、NEON `fcvtl`/AVX2 向量加载原语都在路线图上（见主
