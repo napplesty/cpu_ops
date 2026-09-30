@@ -8,8 +8,8 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 - f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
 - 组装式算子开发（CUTLASS 式）：fused attention（GQA/MHA/MQA）、MLA
-  （DeepSeek 吸收式）与 DSA（DeepSeek-V3.2 稀疏注意力）作为 `examples/` 的
-  组装参考，不进核心库——见「组织方式」
+  （DeepSeek 吸收式）、DSA（DeepSeek-V3.2 稀疏注意力）与 CSA（NSA 式
+  压缩稀疏注意力）作为 `examples/` 的组装参考，不进核心库——见「组织方式」
 - Split-K：深 k 自动切分 + 确定性两阶段归约
 - 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
 - ARM 支持：NEON / SVE2 定长 / SME（实验性）
@@ -19,13 +19,14 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 
 ```bash
 cmake -B build && cmake --build build -j
-ctest --test-dir build          # 17 个测试：11 个核心（simd/gemm/int8/f16/mx/fusion + 标量回退）
-                                 # + 6 个组装示例自校验（attention/mla/dsa × 普通/标量）
+ctest --test-dir build          # 19 个测试：11 个核心（simd/gemm/int8/f16/mx/fusion + 标量回退）
+                                 # + 8 个组装示例自校验（attention/mla/dsa/csa × 普通/标量）
 ./build/basic_gemm              # 最小示例
 ./build/benchmark               # GFLOPS / GOPS 基准
 ./build/examples/02_fused_attention/fused_attention --bench   # fused attention
 ./build/examples/03_mla/mla --bench                           # MLA
 ./build/examples/04_dsa/dsa --bench                           # DSA（对比稠密 MLA）
+./build/examples/05_csa/csa --bench                           # CSA（对比稠密 MLA）
 ```
 
 ## 组织方式（CUTLASS 式）
@@ -34,7 +35,7 @@ ctest --test-dir build          # 17 个测试：11 个核心（simd/gemm/int8/f
 每个目录自包含：自己的头文件、自校验（double 参考 + 确定性断言）与基准合一的
 main、目录级 `CMakeLists.txt` 与 README，并挂到 CTest（含标量回退构建）。这与
 CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head_attention`
-而非核心库。要实现自己的算子（如 CSA / KDA），照抄一个目录：包含
+而非核心库。要实现自己的算子（如 KDA），照抄一个目录：包含
 `cpu_ops/detail/*` 原语头或相邻例子的头，在自己的编译单元里实例化。
 
 - `examples/02_fused_attention/`：fused 块内核 + `Attention<T>` 入口
@@ -45,8 +46,12 @@ CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head
 - `examples/04_dsa/`：DSA（DeepSeek-V3.2 稀疏注意力）= lightning indexer
   （ReLU 头混合打分，GEMM/GEMV 双路径）→ 因果前缀精确 top-k → CLS 汇总
   token → gather + 无 pack M=1 稀疏行核（decode 专用小 M 内核的第一个实例）。
+- `examples/05_csa/`：CSA（NSA 式三分支）= 压缩分支（块质心，可注入上游
+  φ 缓存）+ 选块分支（**打分复用压缩分支 softmax 分数**、跨头求和、整块
+  gather、固定激活首块/局部块）+ 窗口分支，sigmoid 门控求和；复用 04 的
+  流式行核原语。
 - 确定性契约贯穿所有组装：kv-split 关闭时单/多线程**逐位一致**；开启时按固定
-  slice 顺序归并，跨运行**逐位一致**（DSA 的行路径无 split，天然逐位稳定）。
+  slice 顺序归并，跨运行**逐位一致**（DSA/CSA 的行路径无 split，天然逐位稳定）。
 
 CMake 选项：`CPU_OPS_ENABLE_NATIVE`（默认 ON，`-march=native`）、
 `CPU_OPS_BUILD_EXAMPLES`、`CPU_OPS_BUILD_TESTS`。
@@ -154,11 +159,10 @@ gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦�
 `(x, row, col)` + `apply_vec` 车道形式，可自由扩展。融合 epilogue 不在静态库中
 预实例化——包含 `gemm_fused.h` 即在自己的编译单元内联整个 kernel。
 
-### Attention / MLA / DSA（组装示例）
+### Attention / MLA / DSA / CSA（组装示例）
 
-fused attention、MLA 与 DSA 的完整用法、组装方式与扩展缝见
-`examples/02_fused_attention/README.md`、`examples/03_mla/README.md` 与
-`examples/04_dsa/README.md`。要点：
+fused attention、MLA、DSA 与 CSA 的完整用法、组装方式与扩展缝见
+`examples/02_fused_attention/README.md` … `examples/05_csa/README.md`。要点：
 
 ```cpp
 #include "examples/02_fused_attention/attention.h"   // 或按例子目录引用
@@ -195,6 +199,7 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `attention::Attention<T>`（示例） | f32/f16/bf16 → 同型 | QKᵀ + online softmax + PV 融合，f32 累加 |
 | `attention::MlaAttention<T>`（示例） | 共享 latent cache → 每 head 输出 | 吸收式：2×GEMM + fused 核心（dim_v ≠ dim） |
 | `attention::DsaAttention<T>`（示例） | latent cache + indexer → 每 head 输出 | 稀疏式：indexer 打分 + 精确 top-k + CLS + 无 pack 行核 |
+| `attention::CsaAttention<T>`（示例） | latent cache（+压缩缓存）→ 每 head 输出 | 三分支：压缩/选块（top-n 块）/窗口，sigmoid 门控求和 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
 乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
@@ -273,11 +278,21 @@ topk=2048，bf16，对同形稠密 MLA）：
 | 32768 | 113.9 | 18.5 | 6.2x | 31.7 |
 | 65536 | 226.0 | 29.8 | 7.6x | 38.9 |
 
-稀疏路径把每 token 的 KV 触达从整条 cache 降到 indexer key 流 + 一次 CLS
-扫描 + 2048 行 gather，且全部走无 pack 流式核——64k 上下文下 decode 提速
-7.6×。DSA prefill（512×8192）当前为 0.34×：逐行精确选集使注意力只能以
+CSA decode（同机同形，NSA 默认 block=64、top-16 块、window=512）：
+
+| kv len | MLA 4T ms | CSA 4T ms | 加速比 |
+|---|---|---|---|
+| 8192 | 32.8 | 6.0 | 5.5x |
+| 32768 | 115.2 | 10.2 | 11.3x |
+| 65536 | 225.7 | 16.0 | 14.2x |
+
+CSA 的块打分直接复用压缩分支（64k 下每头仅 1024 行质心点积），decode
+耗时随上下文增长极缓；DSA 的独立 indexer 每 token 要扫 64×128 的 key
+流——两者是 token 粒度精确选集 vs 块粒度近似选集的结构取舍。稀疏路径
+把每 token 的 KV 触达从整条 cache 降到几百~几千行且全部无 pack顺流。DSA
+prefill（512×8192）为 0.34×、CSA 为 0.53×：逐行选集语义使注意力只能以
 M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_attention|--bench`
-与 `examples/04_dsa/dsa --bench`）
+、`examples/04_dsa/dsa --bench` 与 `examples/05_csa/csa --bench`）
 
 ### 已知限制
 
@@ -288,11 +303,13 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
   （MLA 下尤甚）；DSA 的稀疏行核是无 pack 小 M 路径的第一个实例，但窄存→f32
   目前是逐元素软件转换（NEON `fcvtl` / AVX2 打包加载原语待做，decode 还能
   再快 ~2–3×）。
-- DSA prefill 保持逐行精确 top-k 语义，注意力阶段只能 M=1 行核执行，慢于
-  稠密 GEMM 路径；查询面板共享选集（union of panel）以重回 GEMM 核是后续
-  工作。DSA 的 FP8 indexer 在 CPU 上的对应物（int8 点积原语）待接。
-- MLA→DSA→CSA 路线：DSA 已完成（`examples/04_dsa/`），CSA / KDA 未实现，
-  扩展缝见 `attention/attention.h`。
+- DSA/CSA prefill 保持逐行精确选集语义，注意力阶段只能 M=1 行核执行，慢于
+  稠密 GEMM 路径（DSA 0.34x / CSA 0.53x @512×8192）；查询面板共享选集以
+  重回 GEMM 核是后续工作。DSA 的 FP8 indexer 在 CPU 上的对应物（int8 点积
+  原语）待接。
+- MLA→DSA→CSA 路线：DSA、CSA 已完成（`examples/04_dsa/`、`examples/05_csa/`），
+  KDA（sigmoid-decay 权重变换替换 exp2，无 running max）未实现，扩展缝见
+  `attention/attention.h`。
 
 ## 架构
 
@@ -389,5 +406,7 @@ examples/
     ├── mla.h  mla.cc  CMakeLists.txt  README.md
 └── 04_dsa/                          # 组装示例：DSA 稀疏注意力（同构）
     ├── dsa.h  dsa.cc  CMakeLists.txt  README.md
-test/      核心单元测试（attention/mla/dsa 的校验在各自示例 main 中）
+└── 05_csa/                          # 组装示例：CSA（NSA 式三分支，复用 04 行核）
+    ├── csa.h  csa.cc  CMakeLists.txt  README.md
+test/      核心单元测试（attention/mla/dsa/csa 的校验在各自示例 main 中）
 ```
