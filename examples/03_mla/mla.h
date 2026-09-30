@@ -38,7 +38,7 @@
 #include <new>
 #include <type_traits>
 
-#include "cpu_ops/attention/attention.h"
+#include "../02_fused_attention/attention.h"
 #include "cpu_ops/detail/thread_pool.h"
 #include "cpu_ops/gemm/device/gemm.h"
 #include "cpu_ops/status.h"

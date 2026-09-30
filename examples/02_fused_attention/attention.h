@@ -32,7 +32,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "cpu_ops/detail/attention_kernel.h"
+#include "attention_kernel.h"
 #include "cpu_ops/detail/mma_policy_fma.h"
 #include "cpu_ops/detail/mma_policy_widen.h"
 #include "cpu_ops/detail/thread_pool.h"
