@@ -439,6 +439,9 @@ int main(int argc, char** argv) {
       {"dsa_full_b2", 2, 2, 40, 40, 32, 16, 64, 2, 32, 128, false, true},
       {"dsa_decode", 1, 4, 1, 300, 16, 8, 32, 3, 24, 128, true, true},
       {"dsa_nocls", 1, 3, 20, 77, 24, 8, 48, 2, 32, 25, true, false},
+      // hi > 8 exercises the blocked indexer GEMV across concurrent
+      // head-block tasks (decode-sized rows keep the GEMV path).
+      {"dsa_multiblock", 1, 2, 3, 131, 32, 16, 64, 12, 24, 40, true, true},
   };
 
   for (const Problem& pr : probs) {

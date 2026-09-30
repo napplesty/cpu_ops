@@ -110,6 +110,19 @@ void run_batched(thread::ThreadPool& pool, int n, int p, F&& fn) {
   }
 }
 
+// Vector widen dispatch: storage-typed rows enter the streaming kernels as
+// f32 lanes (single-instruction converts on NEON/AVX2, scalar elsewhere).
+template <int W, typename T>
+inline simd::Vec<float, W> widen_vec(const T* p) {
+  if constexpr (std::is_same<T, float>::value) {
+    return simd::Vec<float, W>::load(p);
+  } else if constexpr (std::is_same<T, float16_t>::value) {
+    return simd::widen_f16<W>(reinterpret_cast<const uint16_t*>(p));
+  } else {
+    return simd::widen_bf16<W>(reinterpret_cast<const uint16_t*>(p));
+  }
+}
+
 // Streaming kernels: fixed ascending order, f32 accumulation, narrow
 // storage widened in W-wide chunks. These are the whole point of the row
 // path — no panel packing anywhere. The two operand types differ where an
@@ -122,12 +135,7 @@ inline float dot_f32(const TA* a, const TB* b, int n) {
   FV acc = FV::set1(0.0f);
   int i = 0;
   for (; i + W <= n; i += W) {
-    float fa[W], fb[W];
-    for (int l = 0; l < W; ++l) {
-      fa[l] = static_cast<float>(a[i + l]);
-      fb[l] = static_cast<float>(b[i + l]);
-    }
-    acc = simd::fmadd(FV::load(fa), FV::load(fb), acc);
+    acc = simd::fmadd(widen_vec<W>(a + i), widen_vec<W>(b + i), acc);
   }
   float s = simd::hsum(acc);
   for (; i < n; ++i) s += static_cast<float>(a[i]) * static_cast<float>(b[i]);
@@ -140,12 +148,24 @@ inline void axpy_f32(float a, const T* x, float* y, int n) {
   using FV = simd::Vec<float, W>;
   int i = 0;
   for (; i + W <= n; i += W) {
-    float fx[W];
-    for (int l = 0; l < W; ++l) fx[l] = static_cast<float>(x[i + l]);
-    FV v = simd::fmadd(FV::set1(a), FV::load(fx), FV::load(y + i));
+    FV v = simd::fmadd(FV::set1(a), widen_vec<W>(x + i), FV::load(y + i));
     v.store(y + i);
   }
   for (; i < n; ++i) y[i] += a * static_cast<float>(x[i]);
+}
+
+// Row-wise widening copy: y[i] = s * float(x[i]) (s = 1 for plain copies).
+template <typename T>
+inline void widen_row(const T* x, float* y, int n, float s = 1.0f) {
+  constexpr int W = simd::native_width<float>();
+  using FV = simd::Vec<float, W>;
+  int i = 0;
+  for (; i + W <= n; i += W) {
+    FV v = widen_vec<W>(x + i);
+    if (s != 1.0f) v = simd::mul(v, FV::set1(s));
+    v.store(y + i);
+  }
+  for (; i < n; ++i) y[i] = s * static_cast<float>(x[i]);
 }
 
 }  // namespace dsa_detail
@@ -290,19 +310,48 @@ Status DsaAttention<T>::operator()(const Arguments& args, int num_threads) const
         (void)gemm(ga, 1);  // dimensions pre-validated
       });
     } else {
-      dsa_detail::run_batched(pool, rows * hi, p, [&](int task, int /*tid*/) {
+      // Decode-sized chunks keep a no-pack GEMV, but blocked over indexer
+      // heads: one k_idx stream pass serves HB heads (the naive per-head
+      // GEMV would stream the whole key cache hi times — at 64 heads and
+      // 64k tokens that is ~1 GB per query row, pure bandwidth wall). Both
+      // operands are widened once per pass, so the inner loop is a plain
+      // f32 dot and the per-(row, head) results are bit-identical to the
+      // unblocked form.
+      constexpr int HB = 8;
+      // Per-thread widen scratch (tid slots): tasks of one wave run
+      // concurrently and would race on shared buffers. parallel_for hands
+      // out the worker's pool id (0 .. pool.num_threads()-1), not a slot in
+      // [0, p), so size by the pool.
+      const int nslots = pool.num_threads();
+      float* qf = dsa_detail::new_fbuf(static_cast<std::size_t>(nslots) * HB * di);
+      float* kf = dsa_detail::new_fbuf(static_cast<std::size_t>(nslots) * di);
+      const int jblocks = (hi + HB - 1) / HB;
+      dsa_detail::run_batched(pool, rows * jblocks, p, [&](int task, int tid) {
         const int r = task % rows;
-        const int j = task / rows;
-        const T* qj = args.q_idx +
+        const int j0 = (task / rows) * HB;
+        const int jb = std::min(HB, hi - j0);
+        float* qft = qf + static_cast<std::size_t>(tid) * HB * di;
+        float* kft = kf + static_cast<std::size_t>(tid) * di;
+        const T* qb = args.q_idx +
                       (static_cast<std::size_t>(bi) * sq + r0 + r) * hi * di +
-                      static_cast<std::size_t>(j) * di;
+                      static_cast<std::size_t>(j0) * di;
+        for (int j = 0; j < jb; ++j) {
+          dsa_detail::widen_row(qb + static_cast<std::size_t>(j) * di,
+                                qft + static_cast<std::size_t>(j) * di, di);
+        }
         float* out = dots + static_cast<std::size_t>(r) * dots_elems +
-                     static_cast<std::size_t>(j) * skv;
+                     static_cast<std::size_t>(j0) * skv;
         for (int s = 0; s < skv; ++s) {
-          out[s] = args.indexer_scale *
-                   dsa_detail::dot_f32(qj, ki_b + static_cast<std::size_t>(s) * di, di);
+          dsa_detail::widen_row(ki_b + static_cast<std::size_t>(s) * di, kft, di);
+          for (int j = 0; j < jb; ++j) {
+            out[static_cast<std::size_t>(j) * skv + s] =
+                args.indexer_scale *
+                dsa_detail::dot_f32(qft + static_cast<std::size_t>(j) * di, kft, di);
+          }
         }
       });
+      dsa_detail::del_buf(qf);
+      dsa_detail::del_buf(kf);
     }
 
     // ---- 1b: head-mix, score mirror, exact top-k, gather, CLS weights --

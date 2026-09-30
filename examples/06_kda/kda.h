@@ -63,6 +63,21 @@ using dsa_detail::del_buf;
 using dsa_detail::dot_f32;
 using dsa_detail::new_fbuf;
 using dsa_detail::run_batched;
+using dsa_detail::widen_row;
+
+// row += kc * (v − u): the naive mode's per-token state correction.
+template <typename T>
+inline void delta_row(float kc, const T* v, const float* u, float* row, int n) {
+  constexpr int W = simd::native_width<float>();
+  using FV = simd::Vec<float, W>;
+  int i = 0;
+  for (; i + W <= n; i += W) {
+    const FV d = simd::sub(dsa_detail::widen_vec<W>(v + i), FV::load(u + i));
+    FV r = simd::fmadd(FV::set1(kc), d, FV::load(row + i));
+    r.store(row + i);
+  }
+  for (; i < n; ++i) row[i] += kc * (static_cast<float>(v[i]) - u[i]);
+}
 
 inline float sigmoidf_stable(float x) {
   return 1.0f / (1.0f + std::expf(-x));
@@ -83,12 +98,11 @@ inline float decay_dot(const float* a, const float* b, const float* ga,
   constexpr int W = simd::native_width<float>();
   using FV = simd::Vec<float, W>;
   FV acc = FV::set1(0.0f);
-  const FV neg1 = FV::set1(-1.0f);
   const FV log2e = FV::set1(1.4426950408889634f);
   int i = 0;
   for (; i + W <= d; i += W) {
     const FV va = FV::load(a + i), vb = FV::load(b + i);
-    const FV gd = simd::add(FV::load(ga + i), simd::mul(neg1, FV::load(gs + i)));
+    const FV gd = simd::sub(FV::load(ga + i), FV::load(gs + i));
     const FV e = simd::exp2(simd::mul(gd, log2e));
     acc = simd::fmadd(simd::mul(va, vb), e, acc);
   }
@@ -212,9 +226,7 @@ Status KdaAttention<T>::operator()(const Arguments& args, int num_threads) const
         }
         // δ = v − u;  S += β · k ⊗ δ
         for (int c = 0; c < dk; ++c) {
-          const float kc = beta * static_cast<float>(kt[c]);
-          float* row = S + c * dv;
-          for (int j = 0; j < dv; ++j) row[j] += kc * (static_cast<float>(vt[j]) - u[j]);
+          kda_detail::delta_row(beta * static_cast<float>(kt[c]), vt, u, S + c * dv, dv);
         }
         // o_t = (scale·q)ᵀ S
         for (int j = 0; j < dv; ++j) ot[j] = 0.0f;
@@ -259,13 +271,13 @@ Status KdaAttention<T>::operator()(const Arguments& args, int num_threads) const
           float* vrow = vw + static_cast<std::size_t>(t) * dv;
           float* grow = G + static_cast<std::size_t>(t) * dk;
           const float* gprev = t ? G + static_cast<std::size_t>(t - 1) * dk : nullptr;
+          kda_detail::widen_row(qt, qrow, dk, args.scale);
+          kda_detail::widen_row(kt, krow, dk);
+          kda_detail::widen_row(vt, vrow, dv);
           for (int c = 0; c < dk; ++c) {
-            qrow[c] = args.scale * static_cast<float>(qt[c]);
-            krow[c] = static_cast<float>(kt[c]);
             const float lg = kda_detail::log_sigmoidf(static_cast<float>(gt[c]));
             grow[c] = lg + (gprev ? gprev[c] : 0.0f);
           }
-          for (int j = 0; j < dv; ++j) vrow[j] = static_cast<float>(vt[j]);
         }
         // Decay kernels come in two exact flavors. The pairwise kernel
         // ⟨a_t, b_s⟩_decay = Σ_c a[c]·b[c]·e^{G_t[c]−G_s[c]} costs an exp

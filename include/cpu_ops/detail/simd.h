@@ -83,6 +83,13 @@ inline Vec<T, N> add(const Vec<T, N>& a, const Vec<T, N>& b) {
 }
 
 template <typename T, int N>
+inline Vec<T, N> sub(const Vec<T, N>& a, const Vec<T, N>& b) {
+  Vec<T, N> r;
+  for (int i = 0; i < N; ++i) r.v[i] = a.v[i] - b.v[i];
+  return r;
+}
+
+template <typename T, int N>
 inline Vec<T, N> max(const Vec<T, N>& a, const Vec<T, N>& b) {
   Vec<T, N> r;
   for (int i = 0; i < N; ++i) r.v[i] = a.v[i] < b.v[i] ? b.v[i] : a.v[i];
@@ -112,6 +119,55 @@ inline Vec<int32_t, N> dpbusd(Vec<int32_t, N> acc, Vec<int32_t, N> a, Vec<int32_
     acc.v[l] += s;
   }
   return acc;
+}
+
+// ---- Narrow → f32 widening loads -----------------------------------------
+// Raw 16-bit layouts only (IEEE binary16; bfloat16 is the high half of a
+// binary32), so these stay independent of element_types.h. ISA sections
+// below override the generic versions with single-instruction converts.
+
+inline float f16_bits_to_f32(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+  const uint32_t mant = h & 0x3FF;
+  const uint32_t exp = (h >> 10) & 0x1F;
+  uint32_t f;
+  if (exp == 0) {
+    if (mant == 0) {
+      f = sign;  // ±0
+    } else {  // denormal: normalize into the f32 exponent range
+      uint32_t e = 127 - 15 + 1;
+      uint32_t m = mant;
+      while (!(m & 0x400)) {
+        m <<= 1;
+        --e;
+      }
+      f = sign | (e << 23) | ((m & 0x3FF) << 13);
+    }
+  } else if (exp == 31) {
+    f = sign | 0x7F800000u | (mant << 13);  // inf / nan
+  } else {
+    f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+  float out;
+  std::memcpy(&out, &f, 4);
+  return out;
+}
+
+template <int W>
+inline Vec<float, W> widen_f16(const uint16_t* p) {
+  Vec<float, W> r;
+  for (int i = 0; i < W; ++i) r.v[i] = f16_bits_to_f32(p[i]);
+  return r;
+}
+
+template <int W>
+inline Vec<float, W> widen_bf16(const uint16_t* p) {
+  Vec<float, W> r;
+  for (int i = 0; i < W; ++i) {
+    const uint32_t f = static_cast<uint32_t>(p[i]) << 16;
+    std::memcpy(&r.v[i], &f, 4);
+  }
+  return r;
 }
 
 // ---- Softmax helpers (f32 lanes) -----------------------------------------
@@ -169,6 +225,27 @@ inline Vec<float, 8> mul(const Vec<float, 8>& a, const Vec<float, 8>& b) {
 inline Vec<float, 8> add(const Vec<float, 8>& a, const Vec<float, 8>& b) {
   return _mm256_add_ps(a.v, b.v);
 }
+inline Vec<float, 8> sub(const Vec<float, 8>& a, const Vec<float, 8>& b) {
+  return _mm256_sub_ps(a.v, b.v);
+}
+
+// Widening loads: bf16 is a zero-extend + shift; f16 wants F16C (present on
+// effectively every AVX2 part) and otherwise stays on the generic path.
+template <>
+inline Vec<float, 8> widen_bf16<8>(const uint16_t* p) {
+  const __m256i u = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+  Vec<float, 8> r;
+  r.v = _mm256_castsi256_ps(_mm256_slli_epi32(u, 16));
+  return r;
+}
+#if defined(__F16C__)
+template <>
+inline Vec<float, 8> widen_f16<8>(const uint16_t* p) {
+  Vec<float, 8> r;
+  r.v = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+  return r;
+}
+#endif
 inline Vec<float, 8> max(const Vec<float, 8>& a, const Vec<float, 8>& b) {
   return _mm256_max_ps(a.v, b.v);
 }
@@ -384,6 +461,24 @@ inline Vec<float, 4> mul(const Vec<float, 4>& a, const Vec<float, 4>& b) {
 }
 inline Vec<float, 4> add(const Vec<float, 4>& a, const Vec<float, 4>& b) {
   return vaddq_f32(a.v, b.v);
+}
+inline Vec<float, 4> sub(const Vec<float, 4>& a, const Vec<float, 4>& b) {
+  return vsubq_f32(a.v, b.v);
+}
+
+// Widening loads: f16 is one vcvt per 4 lanes; bf16 is a 16-bit left shift
+// into the f32 lanes.
+template <>
+inline Vec<float, 4> widen_f16<4>(const uint16_t* p) {
+  Vec<float, 4> r;
+  r.v = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p)));
+  return r;
+}
+template <>
+inline Vec<float, 4> widen_bf16<4>(const uint16_t* p) {
+  Vec<float, 4> r;
+  r.v = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
+  return r;
 }
 inline Vec<float, 4> max(const Vec<float, 4>& a, const Vec<float, 4>& b) {
   return vmaxq_f32(a.v, b.v);

@@ -64,6 +64,7 @@ using dsa_detail::del_buf;
 using dsa_detail::dot_f32;
 using dsa_detail::new_fbuf;
 using dsa_detail::run_batched;
+using dsa_detail::widen_row;
 
 // One online-softmax pass over n_rows rows of width dcat; accumulates the
 // first dc columns into O (unnormalized: O = Σ exp(s−m)·row[:dc]) and the
@@ -207,7 +208,7 @@ Status CsaAttention<T>::operator()(const Arguments& args, int num_threads) const
       csa_detail::run_batched(pool, nblk, p, [&](int l, int /*tid*/) {
         const T* row = kc + static_cast<std::size_t>(l) * args.compressed_ld;
         float* out = centroids + static_cast<std::size_t>(l) * dcat;
-        for (int d = 0; d < dcat; ++d) out[d] = static_cast<float>(row[d]);
+        csa_detail::widen_row(row, out, dcat);
       });
     } else {
       csa_detail::run_batched(pool, nblk, p, [&](int l, int /*tid*/) {

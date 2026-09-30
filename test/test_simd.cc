@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "cpu_ops/detail/simd.h"
+#include "cpu_ops/element_types.h"
 
 namespace {
 
@@ -76,6 +77,57 @@ void test_dpbusd(const char* name) {
   }
 }
 
+// Widening loads: f16/bf16 bit patterns (random, ±0, denormals, inf/nan)
+// widened to f32 and compared against the scalar conversions, at the native
+// width (ISA specialization) and generic fallback widths.
+template <int W>
+void check_widen_width(const std::vector<uint16_t>& bits) {
+  const auto& f16 = cpu_ops::float16_t::to_float;
+  const auto& bf16 = cpu_ops::bfloat16_t::to_float;
+  for (std::size_t i = 0; i + W <= bits.size(); i += W) {
+    float of[W], ob[W];
+    cpu_ops::simd::widen_f16<W>(bits.data() + i).store(of);
+    cpu_ops::simd::widen_bf16<W>(bits.data() + i).store(ob);
+    for (int l = 0; l < W; ++l) {
+      const float want_f = f16(bits[i + l]);
+      const float want_b = bf16(bits[i + l]);
+      const bool ok_f = (of[l] == want_f) || (std::isnan(of[l]) && std::isnan(want_f));
+      const bool ok_b = (ob[l] == want_b) || (std::isnan(ob[l]) && std::isnan(want_b));
+      if (!ok_f) {
+        ++g_failures;
+        std::printf("FAIL [widen_f16<%d>] bits %04x: got %g want %g\n", W, bits[i + l],
+                    of[l], want_f);
+      }
+      if (!ok_b) {
+        ++g_failures;
+        std::printf("FAIL [widen_bf16<%d>] bits %04x: got %g want %g\n", W,
+                    bits[i + l], ob[l], want_b);
+      }
+    }
+  }
+}
+
+void test_widen() {
+  std::mt19937 rng(1234);
+  const uint16_t specials[] = {
+      0x0000, 0x8000,          // ±0
+      0x0001, 0x8003,          // f16 denormals
+      0x0400, 0x7BFF,          // smallest / largest finite f16
+      0x3C00, 0xC000, 0x3555,  // 1, -2, ~1/3
+      0x7C00, 0xFC00,          // ±inf
+      0x7E00, 0xFE00,          // NaNs
+  };
+  std::vector<uint16_t> bits(specials, specials + sizeof(specials) / sizeof(uint16_t));
+  for (int i = 0; i < 4096; ++i) bits.push_back(static_cast<uint16_t>(rng() % 65536));
+  bits.resize(bits.size() + 16 - bits.size() % 16);
+
+  check_widen_width<1>(bits);
+  check_widen_width<3>(bits);
+  check_widen_width<4>(bits);
+  check_widen_width<8>(bits);
+  check_widen_width<16>(bits);
+}
+
 }  // namespace
 
 int main() {
@@ -92,6 +144,8 @@ int main() {
 
   test_dpbusd<cpu_ops::simd::native_width<int32_t>()>("native int32");
   test_dpbusd<3>("generic int32<3>");
+
+  test_widen();
 
   if (g_failures == 0) {
     std::printf("test_simd: all passed\n");
