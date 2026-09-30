@@ -9,6 +9,10 @@
 // accumulator are owned by the caller, which is what kv-split slices merge
 // later (see attention/attention.h).
 //
+// The Q/K reduction depth (dk) and the V/O width (dv) are independent: MLA's
+// absorbed form attends over a 576-deep latent key but accumulates output
+// over the 512-deep latent value. dv == dk for plain GQA/MHA/MQA.
+//
 // Everything below the mma policy is reused as-is: Q/K/V panels go through
 // the policy's pack functions (widening f16/bf16 to f32 at pack time), and
 // the micro-kernel is the policy's register atom. The softmax statistics use
@@ -39,15 +43,16 @@ constexpr int kKVBlock = 64;  // kv columns per block (multiple of kAttnNR)
 // exp2f(sentinel - m) flushes to 0 without producing NaNs.
 constexpr float kNegInf = -1.0e30f;
 
-// Scratch layout (floats), sized by head dim d:
-//   [0, kQBlock*d)                        packed Q panel
-//   [.  , d_pad*kKVBlock)                 packed B panel (reused for K then V)
-//   [.  , kQBlock*kKVBlock)               packed P panel
-//   [.  , kQBlock*kKVBlock)               S/P buffer (row stride kKVBlock)
-inline std::size_t attention_scratch_elems(int d) {
-  const int d_pad = (d + kAttnNR - 1) / kAttnNR * kAttnNR;
-  return static_cast<std::size_t>(kQBlock) * d +
-         static_cast<std::size_t>(d_pad) * kKVBlock +
+// Scratch layout (floats), sized by the two extents:
+//   [0, kQBlock*dk)                        packed Q panel (kc = dk)
+//   [.  , max(dk, dv_pad)*kKVBlock)        packed B panel (reused for K then V)
+//   [.  , kQBlock*kKVBlock)                packed P panel
+//   [.  , kQBlock*kKVBlock)                S/P buffer (row stride kKVBlock)
+inline std::size_t attention_scratch_elems(int dk, int dv) {
+  const int dv_pad = (dv + kAttnNR - 1) / kAttnNR * kAttnNR;
+  const int b_elems = std::max(dk, dv_pad) * kKVBlock;
+  return static_cast<std::size_t>(kQBlock) * dk +
+         static_cast<std::size_t>(b_elems) +
          2u * static_cast<std::size_t>(kQBlock) * kKVBlock;
 }
 
@@ -59,31 +64,33 @@ struct AttentionBlockKernel {
   static constexpr int kVL = Atom::kVLEN;
 
   // q_head/k_head/v_head point at one (batch, head) panel each, row-major
-  // over [seq, d] with leading dimension *_ld (in elements). Processes query
-  // rows [q0, q0+rows) against kv positions [kv0, kv1); causal masking
+  // over [seq, dim] with leading dimension *_ld (in elements). Processes
+  // query rows [q0, q0+rows) against kv positions [kv0, kv1); causal masking
   // aligns the query block to the *end* of the kv range (query row i attends
-  // kv j <= q0 + i + (seq_kv - seq_q)). On return M/l/O hold the running
-  // softmax statistics and unnormalized output for the processed range.
+  // kv j <= q0 + i + (seq_kv - seq_q)). Q and K reduce over dk lanes; V
+  // contributes dv output lanes. On return M/l/O hold the running softmax
+  // statistics and the unnormalized output (rows x dv) for the range.
   static void run(const T* q_head, int q_ld, const T* k_head, int k_ld,
                   const T* v_head, int v_ld, int rows, int q0, int kv0, int kv1,
-                  int seq_q, int seq_kv, int d, float scale_log2e, bool causal,
-                  float* M, float* l, float* O, float* scratch) {
-    const int d_pad = (d + kAttnNR - 1) / kAttnNR * kAttnNR;
+                  int seq_q, int seq_kv, int dk, int dv, float scale_log2e,
+                  bool causal, float* M, float* l, float* O, float* scratch) {
+    const int dv_pad = (dv + kAttnNR - 1) / kAttnNR * kAttnNR;
+    const int b_elems = std::max(dk, dv_pad) * kKVBlock;
     const int kv_off = seq_kv - seq_q;
     float* qpk = scratch;
-    float* bpk = qpk + static_cast<std::size_t>(kQBlock) * d;
-    float* ppk = bpk + static_cast<std::size_t>(d_pad) * kKVBlock;
+    float* bpk = qpk + static_cast<std::size_t>(kQBlock) * dk;
+    float* ppk = bpk + static_cast<std::size_t>(b_elems);
     float* sp = ppk + static_cast<std::size_t>(kQBlock) * kKVBlock;
 
     // The packed Q panel is built once and reused by every kv block.
     Policy::pack_a(TensorRef<const T, layout::RowMajor>(
                        q_head + static_cast<std::size_t>(q0) * q_ld, q_ld),
-                   0, 0, rows, d, d, kAttnMR, qpk);
+                   0, 0, rows, dk, dk, kAttnMR, qpk);
     for (int i = 0; i < rows; ++i) {
       M[i] = kNegInf;
       l[i] = 0.0f;
     }
-    for (int i = 0; i < rows * d; ++i) O[i] = 0.0f;
+    for (int i = 0; i < rows * dv; ++i) O[i] = 0.0f;
 
     for (int c0 = kv0; c0 < kv1; c0 += kKVBlock) {
       const int nb = std::min(kKVBlock, kv1 - c0);
@@ -92,17 +99,17 @@ struct AttentionBlockKernel {
       if (causal && c0 > q0 + kv_off + rows - 1) break;
 
       // --- S = Q · Kᵀ into the S buffer (rows x nb, stride kKVBlock) ---
-      // Kᵀ as a [d, seq_kv] column-major matrix: at(k, j) = K[j, k].
-      Policy::pack_b(TensorRef<const T, layout::ColumnMajor>(k_head, k_ld), 0, c0, d, d,
-                     nb, kAttnNR, bpk);
+      // Kᵀ as a [dk, seq_kv] column-major matrix: at(k, j) = K[j, k].
+      Policy::pack_b(TensorRef<const T, layout::ColumnMajor>(k_head, k_ld), 0, c0, dk,
+                     dk, nb, kAttnNR, bpk);
       for (int ir = 0; ir < rows; ir += kAttnMR) {
         for (int jr = 0; jr < nb; jr += kAttnNR) {
           // The atom spills a dense MR x NR tile; scatter it into the
           // kKVBlock-stride S buffer (same pattern as BlockGemm's edge path).
           float tile[kAttnMR][kAttnNR];
           Atom atom;
-          atom.run(qpk + (ir / kAttnMR) * d * kAttnMR,
-                   bpk + (jr / kAttnNR) * d * kAttnNR, d, &tile[0][0]);
+          atom.run(qpk + (ir / kAttnMR) * dk * kAttnMR,
+                   bpk + (jr / kAttnNR) * dk * kAttnNR, dk, &tile[0][0]);
           for (int i = 0; i < kAttnMR && ir + i < rows; ++i)
             for (int j = 0; j < kAttnNR; ++j)
               sp[static_cast<std::size_t>(ir + i) * kKVBlock + jr + j] = tile[i][j];
@@ -151,22 +158,22 @@ struct AttentionBlockKernel {
         l[i] = l[i] * a + l_tile;
         M[i] = m_new;
 
-        float* orow = O + static_cast<std::size_t>(i) * d;
+        float* orow = O + static_cast<std::size_t>(i) * dv;
         const VecT av = VecT::set1(a);
         int e = 0;
-        for (; e + kVL <= d; e += kVL)
+        for (; e + kVL <= dv; e += kVL)
           simd::mul(VecT::load(orow + e), av).store(orow + e);
-        for (; e < d; ++e) orow[e] *= a;
+        for (; e < dv; ++e) orow[e] *= a;
       }
 
-      // --- O += P · V over the whole head dim ---
+      // --- O += P · V over the value extent ---
       // P is already f32 in the S buffer; pack directly (bypasses the policy,
       // which is typed for the storage element).
       cpu_ops::detail::pack_a(TensorRef<const float, layout::RowMajor>(sp, kKVBlock), 0, 0,
                               rows, nb, kAttnMR, ppk);
-      Policy::pack_b(TensorRef<const T, layout::RowMajor>(v_head, v_ld), c0, 0, nb, nb, d,
-                     kAttnNR, bpk);
-      for (int dn = 0; dn < d; dn += kAttnNR) {
+      Policy::pack_b(TensorRef<const T, layout::RowMajor>(v_head, v_ld), c0, 0, nb, nb,
+                     dv, kAttnNR, bpk);
+      for (int dn = 0; dn < dv; dn += kAttnNR) {
         for (int ir = 0; ir < rows; ir += kAttnMR) {
           Atom atom;
           atom.clear();
@@ -174,7 +181,7 @@ struct AttentionBlockKernel {
                    bpk + (dn / kAttnNR) * nb * kAttnNR, nb);
           const int imax = std::min(kAttnMR, rows - ir);
           for (int i = 0; i < imax; ++i) {
-            float* orow = O + static_cast<std::size_t>(ir + i) * d + dn;
+            float* orow = O + static_cast<std::size_t>(ir + i) * dv + dn;
             for (int w = 0; w < Atom::kVecN; ++w)
               simd::add(VecT::load(orow + w * kVL), atom.acc[i][w])
                   .store(orow + w * kVL);

@@ -82,6 +82,10 @@ struct Attention {
     int seq_q = 0;
     int seq_kv = 0;
     int dim = 0;
+    // Value/output extent. 0 = same as dim (plain attention). MLA's absorbed
+    // form sets dim = latent+rope (e.g. 576) for the Q/K reduction and
+    // dim_v = latent (e.g. 512) for the V accumulation/output.
+    int dim_v = 0;
 
     const T* q = nullptr;
     int q_stride_b = 0, q_stride_h = 0, q_ld = 0;
@@ -108,6 +112,7 @@ template <typename T>
 Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
   const int b = args.batch, hq = args.heads_q, hkv = args.heads_kv;
   const int sq = args.seq_q, skv = args.seq_kv, d = args.dim;
+  const int dv = args.dim_v > 0 ? args.dim_v : d;  // value/output extent
   if (b < 0 || hq < 1 || hkv < 1 || sq < 0 || skv < 0 || d < 1) {
     return Status::kErrorInvalidProblem;
   }
@@ -115,8 +120,9 @@ Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
   if (skv == 0) return Status::kErrorInvalidProblem;
   if (hq % hkv != 0) return Status::kErrorInvalidArguments;
   if (args.causal && skv < sq) return Status::kErrorInvalidArguments;
+  if (args.dim_v < 0) return Status::kErrorInvalidProblem;
   if (!args.q || !args.k || !args.v || !args.o) return Status::kErrorInvalidArguments;
-  if (args.q_ld < d || args.k_ld < d || args.v_ld < d || args.o_ld < d) {
+  if (args.q_ld < d || args.k_ld < d || args.v_ld < dv || args.o_ld < dv) {
     return Status::kErrorInvalidArguments;
   }
 
@@ -183,9 +189,9 @@ Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
              static_cast<std::size_t>(q0) * args.o_ld;
     for (int i = 0; i < rows; ++i) {
       const float inv = l[i] > 0.0f ? 1.0f / l[i] : 0.0f;
-      const float* orow = O + static_cast<std::size_t>(i) * d;
+      const float* orow = O + static_cast<std::size_t>(i) * dv;
       T* orow_out = out + static_cast<std::size_t>(i) * args.o_ld;
-      for (int j = 0; j < d; ++j) orow_out[j] = T(orow[j] * inv);
+      for (int j = 0; j < dv; ++j) orow_out[j] = T(orow[j] * inv);
     }
   };
 
@@ -197,12 +203,12 @@ Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
       const int q0 = qb * kQBlock;
       const int rows = std::min(kQBlock, sq - q0);
       const auto kv = head_kv(bi, h);
-      float* scratch = detail_storage::new_buf(attention_scratch_elems(d));
+      float* scratch = detail_storage::new_buf(attention_scratch_elems(d, dv));
       float* stats = detail_storage::new_buf(2u * kQBlock);  // M then l
-      float* O = detail_storage::new_buf(static_cast<std::size_t>(kQBlock) * d);
+      float* O = detail_storage::new_buf(static_cast<std::size_t>(kQBlock) * dv);
       Kernel::run(head_q(bi, h), args.q_ld, kv.first, args.k_ld, kv.second, args.v_ld,
-                  rows, q0, 0, skv, sq, skv, d, scale_log2e, args.causal, /*M=*/stats,
-                  /*l=*/stats + kQBlock, O, scratch);
+                  rows, q0, 0, skv, sq, skv, d, dv, scale_log2e, args.causal,
+                  /*M=*/stats, /*l=*/stats + kQBlock, O, scratch);
       write_output(bi, h, q0, rows, O, stats + kQBlock);
       detail_storage::free_buf(scratch);
       detail_storage::free_buf(stats);
@@ -214,7 +220,7 @@ Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
 
   // Phase 1: every (query panel, slice) reduces its kv range into a slab of
   // partial statistics: [M: kQBlock | l: kQBlock | O: kQBlock x d] floats.
-  const std::size_t slab_elems = static_cast<std::size_t>(kQBlock) * (d + 2);
+  const std::size_t slab_elems = static_cast<std::size_t>(kQBlock) * (dv + 2);
   float* ws = detail_storage::new_buf(slab_elems * n_tasks * slices);
   const auto phase1 = [&](int task, int /*thread_index*/) {
     const int slice = task % slices;
@@ -228,9 +234,9 @@ Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
     const int kv1 = static_cast<int>(static_cast<long long>(skv) * (slice + 1) / slices);
     const auto kv = head_kv(bi, h);
     float* slab = ws + static_cast<std::size_t>(task) * slab_elems;
-    float* scratch = detail_storage::new_buf(attention_scratch_elems(d));
+    float* scratch = detail_storage::new_buf(attention_scratch_elems(d, dv));
     Kernel::run(head_q(bi, h), args.q_ld, kv.first, args.k_ld, kv.second, args.v_ld,
-                rows, q0, kv0, kv1, sq, skv, d, scale_log2e, args.causal,
+                rows, q0, kv0, kv1, sq, skv, d, dv, scale_log2e, args.causal,
                 /*M=*/slab, /*l=*/slab + kQBlock, /*O=*/slab + 2 * kQBlock, scratch);
     detail_storage::free_buf(scratch);
   };
@@ -250,7 +256,7 @@ Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
       M[i] = attention::detail::kNegInf;
       l[i] = 0.0f;
     }
-    for (int i = 0; i < rows * d; ++i) O[i] = 0.0f;
+    for (int i = 0; i < rows * dv; ++i) O[i] = 0.0f;
     for (int s = 0; s < slices; ++s) {
       const float* slab = ws + (static_cast<std::size_t>(t) * slices + s) * slab_elems;
       const float* Ms = slab, * ls = slab + kQBlock, * Os = slab + 2 * kQBlock;
@@ -258,9 +264,9 @@ Status Attention<T>::operator()(const Arguments& args, int num_threads) const {
         const float m = std::max(M[i], Ms[i]);
         const float ag = std::exp2f(M[i] - m);
         const float as = std::exp2f(Ms[i] - m);
-        float* orow = O + static_cast<std::size_t>(i) * d;
-        const float* srow = Os + static_cast<std::size_t>(i) * d;
-        for (int j = 0; j < d; ++j) orow[j] = orow[j] * ag + srow[j] * as;
+        float* orow = O + static_cast<std::size_t>(i) * dv;
+        const float* srow = Os + static_cast<std::size_t>(i) * dv;
+        for (int j = 0; j < dv; ++j) orow[j] = orow[j] * ag + srow[j] * as;
         l[i] = l[i] * ag + ls[i] * as;
         M[i] = m;
       }

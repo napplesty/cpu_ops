@@ -8,6 +8,7 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 - f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
 - Fused attention：GQA / MHA / MQA，online softmax 单遍融合，causal 块跳过，decode 自动 KV-split
+- MLA（DeepSeek-V2/V3 吸收式）：共享 latent cache（c‖k_pe），权重吸收复用 GEMM + fused 核心
 - Split-K：深 k 自动切分 + 确定性两阶段归约
 - 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
 - ARM 支持：NEON / SVE2 定长 / SME（实验性）
@@ -17,7 +18,7 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 
 ```bash
 cmake -B build && cmake --build build -j
-ctest --test-dir build          # 13 个测试：simd / gemm / int8 / f16 / mx / fusion / attention + 标量回退
+ctest --test-dir build          # 15 个测试：simd / gemm / int8 / f16 / mx / fusion / attention / mla + 标量回退
 ./build/basic_gemm              # 最小示例
 ./build/benchmark               # GFLOPS / GOPS 基准
 ```
@@ -160,6 +161,32 @@ attn(args);                            // 线程数参数同 GEMM
 - 深入稀疏 / 线性变体（CSA、KDA、DSA）的扩展缝（kv 迭代、块准入谓词、
   权重变换）见 `attention/attention.h` 头注释。
 
+### MLA（吸收式，DeepSeek-V2/V3）
+
+```cpp
+using Mla = cpu_ops::attention::MlaAttention<float>;  // 或 f16/bf16（cache 端带宽收益）
+
+// cache: [b][seq_kv][dim_latent + dim_pe]，c(t) ‖ k_pe(t) 共享（RoPE 已上游旋转）；
+// q_nope: [b][h][seq_q][dn]，q_pe: [b][h][seq_q][dp]；
+// w_uk: [h][dc][dn]、w_uv: [h][dn][dc]；输出 o: [b][h][seq_q][dn]。
+Mla::Arguments args;
+args.batch = 1;  args.heads = 32;
+args.seq_q = 1;  args.seq_kv = 4096;
+args.dim_nope = 128; args.dim_pe = 64; args.dim_latent = 512;
+args.q_nope = /*...*/; args.q_pe = /*...*/; args.kv_cache = /*...*/;
+args.w_uk = /*...*/;   args.w_uv = /*...*/;  args.o = /*...*/;
+args.scale = 1.0f / std::sqrt(192.0f);       // 1/sqrt(dn + dp)
+args.causal = true;
+
+Mla mla;
+mla(args);
+```
+
+内部三步：每 head 吸收 GEMM `q̃ = q_nope·W_UKᵀ`（GEMM 并行于 head）→ fused
+核心（`heads_kv=1`、`dim = dc+dp`、`dim_v = dc`，K/V 同一 cache 缓冲）→ 每
+head 反吸收 `o = õ·W_UVᵀ`。确定性契约同上。吸收式比非吸收多 ~3× score
+FLOPs，换来 cache 缩到每 token `(dc+dp)` 个元素。
+
 ### 通用说明
 
 - f32/f64 与 int8 各自的 A/B/C 八种 RowMajor/ColumnMajor 组合均已实例化。
@@ -180,6 +207,7 @@ attn(args);                            // 线程数参数同 GEMM
 | `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32，走 f32 FMA |
 | `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA |
 | `attention::Attention<T>` | f32/f16/bf16 → 同型 | QKᵀ + online softmax + PV 融合，f32 累加 |
+| `attention::MlaAttention<T>` | 共享 latent cache → 每 head 输出 | 吸收式：2×GEMM + fused 核心（dim_v ≠ dim） |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
 乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
@@ -245,16 +273,19 @@ int8（u8×s8→s32）GOPS（一个乘积累加计 2 ops）：
 
 Fused attention（Apple M1 Pro，4T，H=16 d=128 causal f32）：seq 512/1024/2048
 分别 109 / 144 / 181 GFLOPS——约为同机纯 f32 GEMM 吞吐的 74%；bf16 操作数再快
-~3%。decode（seq_q=1）目前走通用面板路径，KV 有效带宽 ~4.6 GB/s，专用小 M
-内核是后续工作。
+~3%。MLA prefill（H=32，dn/dp/dc=128/64/512，f32）seq 1024/2048 为 232 /
+764 ms。decode（seq_q=1）目前走通用面板路径：GQA ~4.6 GB/s，MLA 更差
+（~0.3 GB/s：rows=1 时 K 面板打包成本无法摊销，且各 head 重复打包同一份共享
+K）——专用小 M / 免打包 decode 内核是当前最大的性能缺口。
 
 ### 已知限制
 
 - GEMV 无专用 kernel，单线程 GEMV 约为 OpenBLAS 的 0.5x。
 - 单线程 kernel 相对 OpenBLAS 有 0.82–0.92x 的差距，来自微内核调优深度。
 - ARM 路径（NEON / SVE2 / SME）尚未在大规模部署中验证，SME 为实验性。
-- Attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低；专用
-  小 M 内核待做。稀疏 / 线性变体（CSA / KDA / DSA）尚未实现，扩展缝见
+- Attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低（MLA 下
+  尤甚：共享 K 被各 head 重复打包）；专用小 M / 免打包 decode 内核待做。
+  MLA→DSA→CSA 路线中，稀疏变体（DSA / CSA）尚未实现，扩展缝见
   `attention/attention.h`。
 
 ## 架构
@@ -319,7 +350,8 @@ include/cpu_ops/
 │   ├── gemm_fused.h                 # GemmFusedF32/F64（头文件实例化路径）
 │   └── gemm_mx.h                    # device::GemmMx 声明、E4M3/E5M2/E2M1 别名
 ├── attention/
-│   └── attention.h                  # Attention<T>（GQA/MHA/MQA）+ CSA/KDA/DSA 路线注释
+│   ├── attention.h                  # Attention<T>（GQA/MHA/MQA）+ CSA/KDA/DSA 路线注释
+│   └── mla.h                        # MlaAttention<T>（吸收式 MLA 编排）
 └── detail/                          # 内部实现（模板机制）
     ├── attention_kernel.h           # fused 块内核：Q 驻留 + online softmax + P·V
     ├── simd.h                       # ISA 检测 + simd::Vec（AVX2/VNNI/SVE/NEON/标量）
@@ -343,8 +375,9 @@ src/
 ├── gemm_f16.cc / gemm_bf16.cc       # f16/bf16 → f32 × 8
 ├── gemm_mx.cc                       # MX 同格式组合 × Row/Col C
 ├── attention.cc                     # Attention<f32/f16/bf16> 实例化
+├── mla.cc                           # MlaAttention<f32/f16/bf16> 实例化
 └── gemm_sme_f32.cc                  # SME f32 × 8（非 SME 编译时为空）
-examples/  00_basic_gemm.cc  01_benchmark.cc  02_attention.cc
+examples/  00_basic_gemm.cc  01_benchmark.cc  02_attention.cc  03_mla.cc
 test/      test_simd.cc  test_gemm.cc  test_gemm_int8.cc  test_gemm_f16.cc
-           test_gemm_mx.cc  test_fusion.cc  test_attention.cc
+           test_gemm_mx.cc  test_fusion.cc  test_attention.cc  test_attention_mla.cc
 ```
