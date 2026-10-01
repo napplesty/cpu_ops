@@ -78,7 +78,9 @@ inline Status topk_indices(const float* v, int n, int k, int32_t* out) {
   int need = k;
   for (int level = 3; level >= 0; --level) {
     const int shift = 8 * level;
-    const uint32_t high_mask = ~((1u << (8 * level + 8)) - 1u);
+    // Bytes above the current level; empty at the top level. Written this way
+    // because 1u << 32 (the level-3 case of the natural formula) is UB.
+    const uint32_t high_mask = (level == 3) ? 0u : ~0u << (8 * level + 8);
     uint32_t counts[256] = {0};
     for (int i = 0; i < n; ++i) {
       const uint32_t key = topk_detail::key_of(v[i]);
