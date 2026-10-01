@@ -1,17 +1,34 @@
-#include "cpu_ops/detail/thread_swizzle.h"
+#pragma once
 
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace cpu_ops {
 namespace gemm {
+namespace threadblock {
 
-namespace {
+// Rectangular tile of the output matrix, half-open [m0, m1) x [n0, n1), plus
+// the k range [k0, k1) to reduce (the whole k when the region is unsplit) and
+// the index of the k slice (0 when unsplit), which selects the partial-sum
+// workspace slab.
+struct GemmRegion {
+  int m0 = 0;
+  int m1 = 0;
+  int n0 = 0;
+  int n1 = 0;
+  int k0 = 0;
+  int k1 = 0;
+  int slice = 0;
+};
+
+namespace detail {
 
 // Returns the [begin, length) of slice `idx` when `count` items are split into
 // `parts` balanced contiguous slices (requires 1 <= parts <= count).
-std::pair<int, int> split_range(int count, int parts, int idx) {
+inline std::pair<int, int> split_range(int count, int parts, int idx) {
   const int base = count / parts;
   const int rem = count % parts;
   const int begin = idx * base + std::min(idx, rem);
@@ -19,10 +36,20 @@ std::pair<int, int> split_range(int count, int parts, int idx) {
   return {begin, length};
 }
 
-}  // namespace
+}  // namespace detail
 
-std::vector<GemmRegion> partition_gemm(int m, int n, int k, int mr, int nr, int num_threads,
-                                       int k_slices) {
+// Splits an m x n output into up to num_threads rectangular regions whose
+// boundaries are aligned to mr x nr micro-tiles. The tm x tn grid is chosen to
+// fill the thread count first and to minimize panel re-packing traffic
+// (tn*m*k + tm*k*n) second, since every region packs its own A rows and B
+// columns.
+//
+// With k_slices > 1 the k range is additionally cut into contiguous slices
+// and crossed with the m x n grid, so the result holds grid_regions *
+// k_slices regions; each slice's regions must write to their own partial-sum
+// slab (indexed by slice) that a later reduction pass combines.
+inline std::vector<GemmRegion> partition_gemm(int m, int n, int k, int mr, int nr,
+                                              int num_threads, int k_slices = 1) {
   if (num_threads < 1) num_threads = 1;
   if (k_slices < 1) k_slices = 1;
   const int mt = (m + mr - 1) / mr;
@@ -57,15 +84,15 @@ std::vector<GemmRegion> partition_gemm(int m, int n, int k, int mr, int nr, int 
   std::vector<GemmRegion> regions;
   regions.reserve(static_cast<size_t>(tm) * tn * k_slices);
   for (int s = 0; s < k_slices; ++s) {
-    const auto ks = split_range(k, k_slices, s);
+    const auto ks = detail::split_range(k, k_slices, s);
     const int k0 = ks.first;
     const int k1 = ks.first + ks.second;
     for (int mi = 0; mi < tm; ++mi) {
-      const auto ms = split_range(mt, tm, mi);
+      const auto ms = detail::split_range(mt, tm, mi);
       const int m0 = ms.first * mr;
       const int m1 = std::min(m, (ms.first + ms.second) * mr);
       for (int ni = 0; ni < tn; ++ni) {
-        const auto ns = split_range(nt, tn, ni);
+        const auto ns = detail::split_range(nt, tn, ni);
         const int n0 = ns.first * nr;
         const int n1 = std::min(n, (ns.first + ns.second) * nr);
         regions.push_back({m0, m1, n0, n1, k0, k1, s});
@@ -75,5 +102,6 @@ std::vector<GemmRegion> partition_gemm(int m, int n, int k, int mr, int nr, int 
   return regions;
 }
 
+}  // namespace threadblock
 }  // namespace gemm
 }  // namespace cpu_ops

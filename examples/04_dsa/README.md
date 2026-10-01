@@ -2,7 +2,7 @@
 
 在 MLA 潜空间缓存之上组装 DSA：lightning indexer 打分 → 每 query 精确 top-k
 选 token → CLS 汇总 token → 无 pack 的稀疏行核。`dsa.h` 只依赖库原语
-（`simd::Vec`、线程池），不链接进 `libcpu_ops.a`——CUTLASS 式的组装示例。
+（`simd::Vec`、线程池），不进入核心库——CUTLASS 式的组装示例。
 
 **算法**（按 DeepSeek-V3.2 论文公式 + cuDNN DSA API 语义实现）
 

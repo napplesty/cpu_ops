@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "cpu_ops/cpu_ops.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_amx.h"
 
 namespace {
 
@@ -42,7 +43,9 @@ void ref_gemm_int8(int m, int n, int k, int32_t alpha, const std::vector<uint8_t
   }
 }
 
-template <typename LA, typename LB, typename LC>
+template <typename LA, typename LB, typename LC,
+          typename Config = cpu_ops::gemm::device::GemmConfig<int32_t>,
+          typename Policy = cpu_ops::mma::VnniPolicy>
 void run_case(int m, int n, int k, int32_t alpha, int32_t beta, bool relu,
               int num_threads) {
   ++g_cases;
@@ -66,7 +69,9 @@ void run_case(int m, int n, int k, int32_t alpha, int32_t beta, bool relu,
 
   ref_gemm_int8<LA, LB, LC>(m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, D_ref, ldc, relu);
 
-  using Gemm = cpu_ops::gemm::device::GemmU8S8S32<LA, LB, LC>;
+  using Gemm = cpu_ops::gemm::device::Gemm<uint8_t, LA, int8_t, LB, int32_t, LC, int32_t,
+                                           cpu_ops::epilogue::LinearCombination<int32_t>,
+                                           Config, Policy>;
   typename Gemm::Arguments args{{m, n, k},
                                 {A.data(), lda},
                                 {B.data(), ldb},
@@ -174,6 +179,29 @@ int main() {
   }
 
   check_thread_determinism(129, 255, 97);
+
+  // The experimental AMX-INT8 policy: exact integer arithmetic through the
+  // same packed layouts the tile path consumes. On hosts without AMX (or
+  // without OS tile permission) the atom's scalar fallback is what runs.
+  {
+    using cpu_ops::layout::ColumnMajor;
+    using cpu_ops::layout::RowMajor;
+    using cpu_ops::mma::AmxGemmConfig;
+    using cpu_ops::mma::AmxPolicy;
+    for (const ShapeCfg& s : shapes) {
+      for (int threads : {1, 8}) {
+        run_case<RowMajor, RowMajor, RowMajor, AmxGemmConfig, AmxPolicy>(
+            s.m, s.n, s.k, 1, 0, false, threads);
+        run_case<ColumnMajor, ColumnMajor, ColumnMajor, AmxGemmConfig, AmxPolicy>(
+            s.m, s.n, s.k, 3, -2, false, threads);
+      }
+    }
+    run_case<RowMajor, RowMajor, RowMajor, AmxGemmConfig, AmxPolicy>(16, 24, 0, 1, 5,
+                                                                     false, 4);
+    // Split-k with a slice count not dividing k.
+    run_case<RowMajor, RowMajor, RowMajor, AmxGemmConfig, AmxPolicy>(32, 32, 8192, 1, 1,
+                                                                     true, 8);
+  }
 
   std::printf("test_gemm_int8: %d cases, %d failures\n", g_cases, g_failures);
   return g_failures == 0 ? 0 : 1;

@@ -5,7 +5,7 @@
 // tasks out in p-sized batches (same pattern as the assembled-operator
 // examples). Results are independent of the batch split.
 
-#include "cpu_ops/detail/thread_pool.h"
+#include "cpu_ops/thread/thread_pool.h"
 
 namespace cpu_ops {
 namespace ops {

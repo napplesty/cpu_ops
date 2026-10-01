@@ -70,10 +70,10 @@
 #include <utility>
 
 #include "../03_mla/mla.h"  // AbsorbGemmFor: storage-typed GEMM with f32 output
-#include "cpu_ops/detail/simd.h"
+#include "cpu_ops/arch/simd.h"
 #include "cpu_ops/ops/topk.h"
-#include "cpu_ops/detail/thread_pool.h"
-#include "cpu_ops/element_types.h"
+#include "cpu_ops/thread/thread_pool.h"
+#include "cpu_ops/numeric_types.h"
 #include "cpu_ops/status.h"
 
 namespace cpu_ops {

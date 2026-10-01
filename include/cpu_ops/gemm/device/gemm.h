@@ -1,14 +1,19 @@
 #pragma once
 
-#include "cpu_ops/detail/mma_policy_fma.h"
-#include "cpu_ops/detail/mma_policy_vnni.h"
-#include "cpu_ops/detail/mma_policy_widen.h"
-#include "cpu_ops/detail/simd.h"
-#include "cpu_ops/element_types.h"
+#include <type_traits>
+
+#include "cpu_ops/arch/simd.h"
 #include "cpu_ops/epilogue/linear_combination.h"
-#include "cpu_ops/layout.h"
-#include "cpu_ops/matrix_shape.h"
+#include "cpu_ops/gemm/kernel/run_blocked.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_bf16.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_fma.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_vnni.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_widen.h"
+#include "cpu_ops/gemm_coord.h"
+#include "cpu_ops/layout/matrix.h"
+#include "cpu_ops/numeric_types.h"
 #include "cpu_ops/status.h"
+#include "cpu_ops/tensor_ref.h"
 
 namespace cpu_ops {
 namespace gemm {
@@ -30,11 +35,10 @@ struct GemmConfig {
 //   D = alpha * A * B + beta * C   (optionally fused with an activation)
 //
 // A is m x k, B is k x n, C and D are m x n. C and D may alias each other.
-// Only the declaration lives in this header; the library ships explicit
-// instantiations for float/double with every combination of RowMajor /
-// ColumnMajor operands, the default epilogue, and the default config. Custom
-// epilogues or tile configs can be instantiated by including
-// cpu_ops/detail/gemm_device_defn.h.
+// The library is header-only: including this header makes the full kernel
+// definition available, so any combination of element types, layouts,
+// epilogue, tile config, and mma policy can be instantiated in the including
+// translation unit.
 template <typename ElementA_, typename LayoutA_, typename ElementB_, typename LayoutB_,
           typename ElementC_, typename LayoutC_, typename ElementAccumulator_ = ElementC_,
           typename Epilogue_ = epilogue::LinearCombination<ElementC_>,
@@ -71,7 +75,48 @@ class Gemm {
   Gemm() = default;
 
   // num_threads <= 0 selects the size of the global thread pool.
-  Status operator()(const Arguments& args, int num_threads = 0) const;
+  Status operator()(const Arguments& args, int num_threads = 0) const {
+    static_assert(std::is_same<ElementA, typename MmaPolicy::ElemA>::value &&
+                      std::is_same<ElementB, typename MmaPolicy::ElemB>::value &&
+                      std::is_same<ElementAccumulator, typename MmaPolicy::AccT>::value &&
+                      std::is_same<ElementC, typename MmaPolicy::AccT>::value,
+                  "element types must match the mma policy's ElemA/ElemB, and both the "
+                  "accumulator and C must use the policy's AccT");
+
+    const int m = args.problem_size.m;
+    const int n = args.problem_size.n;
+    const int k = args.problem_size.k;
+    if (m < 0 || n < 0 || k < 0) return Status::kErrorInvalidProblem;
+    if (m == 0 || n == 0) return Status::kSuccess;
+
+    if (k == 0) {
+      // Degenerate product: fold beta * C into D without touching A or B
+      // (which are allowed to be empty in this case).
+      const Epilogue epilogue(args.epilogue);
+      for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) {
+          args.ref_D.at(i, j) = epilogue(ElementC(0), args.ref_C.at(i, j), true, true, i, j);
+        }
+      }
+      return Status::kSuccess;
+    }
+
+    if (!args.ref_A.data() || !args.ref_B.data() || !args.ref_C.data() || !args.ref_D.data()) {
+      return Status::kErrorInvalidArguments;
+    }
+    const int lda_min = LayoutA::kIsRowMajor ? k : m;
+    const int ldb_min = LayoutB::kIsRowMajor ? n : k;
+    const int ldc_min = LayoutC::kIsRowMajor ? n : m;
+    const int ldd_min = ldc_min;
+    if (args.ref_A.ld() < lda_min || args.ref_B.ld() < ldb_min ||
+        args.ref_C.ld() < ldc_min || args.ref_D.ld() < ldd_min) {
+      return Status::kErrorInvalidArguments;
+    }
+
+    return kernel::run_blocked<MmaPolicy, LayoutC, Epilogue, Config>(
+        args.ref_A, args.ref_B, args.ref_C, args.ref_D, m, n, k, args.epilogue,
+        args.split_k_slices, num_threads);
+  }
 };
 
 // uint8 x int8 -> int32 quantized GEMM. Uses 4-way byte dot-product
@@ -91,11 +136,23 @@ using GemmF16F32 = Gemm<float16_t, LayoutA, float16_t, LayoutB, float, LayoutC, 
                         epilogue::LinearCombination<float>, GemmConfig<float>,
                         mma::WidenPolicy<float16_t>>;
 
-// Same, with bfloat16 operands.
+// Same, with bfloat16 operands. With AVX512-BF16 the default computes
+// natively on packed bf16 pairs (vdpbf16ps, f32 accumulation): operand
+// traffic halves versus widening, and numerics differ slightly from the
+// widen path — the bf16 products skip one rounding, so results are if
+// anything more accurate. Pass mma::WidenPolicy<bfloat16_t> and
+// GemmConfig<float> explicitly to force the widening path.
+#if defined(CPU_OPS_SIMD_AVX512BF16)
+template <typename LayoutA, typename LayoutB, typename LayoutC>
+using GemmBF16F32 = Gemm<bfloat16_t, LayoutA, bfloat16_t, LayoutB, float, LayoutC, float,
+                         epilogue::LinearCombination<float>, mma::Bf16GemmConfig,
+                         mma::Bf16Policy>;
+#else
 template <typename LayoutA, typename LayoutB, typename LayoutC>
 using GemmBF16F32 = Gemm<bfloat16_t, LayoutA, bfloat16_t, LayoutB, float, LayoutC, float,
                          epilogue::LinearCombination<float>, GemmConfig<float>,
                          mma::WidenPolicy<bfloat16_t>>;
+#endif
 
 }  // namespace device
 }  // namespace gemm

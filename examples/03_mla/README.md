@@ -1,9 +1,9 @@
 # 03 — MLA (Multi-head Latent Attention, DeepSeek-V2/V3)
 
 Weight-absorbed MLA on top of the fused attention example (`mla.h` includes
-`../02_fused_attention/attention.h`) and the library's pre-instantiated GEMM
-— an assembly example in the CUTLASS sense: nothing here is linked into
-`libcpu_ops.a`.
+`../02_fused_attention/attention.h`) and the library's GEMM — an assembly
+example in the CUTLASS sense: nothing here belongs in the header-only core
+library.
 
 **Shape of the composition**
 

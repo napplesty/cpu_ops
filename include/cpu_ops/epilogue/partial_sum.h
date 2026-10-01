@@ -7,7 +7,7 @@
 // Semantics per k-block: first block stores acc, later blocks accumulate onto
 // the slab value. `source` is the slab's current content.
 
-#include "cpu_ops/detail/simd.h"
+#include "cpu_ops/arch/simd.h"
 
 namespace cpu_ops {
 namespace epilogue {

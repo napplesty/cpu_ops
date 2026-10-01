@@ -7,12 +7,9 @@
 //   LinearRelu::Arguments args{...};
 //   args.epilogue = {1.0f, 1.0f, epilogue::Chain<BiasAdd<float>, Relu>{...}};
 //
-// Unlike the default Gemm instantiations, fused-epilogue kernels are NOT
-// pre-instantiated in the library: including this header instantiates the
-// whole kernel in your translation unit (that is the documented custom-
-// epilogue path).
+// The library is header-only: including this header instantiates the whole
+// fused kernel in your translation unit.
 
-#include "cpu_ops/detail/gemm_device_defn.h"
 #include "cpu_ops/epilogue/fusion.h"
 #include "cpu_ops/gemm/device/gemm.h"
 

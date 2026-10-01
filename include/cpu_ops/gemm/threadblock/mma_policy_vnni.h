@@ -12,11 +12,12 @@
 #include <cstdint>
 #include <cstring>
 
-#include "cpu_ops/detail/simd.h"
-#include "cpu_ops/layout.h"
+#include "cpu_ops/arch/simd.h"
+#include "cpu_ops/tensor_ref.h"
 
 namespace cpu_ops {
-namespace detail {
+namespace gemm {
+namespace threadblock {
 
 template <typename LayoutA>
 void pack_a_vnni(const TensorRef<const uint8_t, LayoutA>& a, int i0, int k0, int mc,
@@ -55,7 +56,8 @@ void pack_b_vnni(const TensorRef<const int8_t, LayoutB>& b, int k0, int j0, int 
   }
 }
 
-}  // namespace detail
+}  // namespace threadblock
+}  // namespace gemm
 
 namespace mma {
 
@@ -125,13 +127,14 @@ struct VnniPolicy {
   template <typename LayoutA>
   static void pack_a(TensorRef<const uint8_t, LayoutA> a, int i0, int k0, int mc, int kc,
                      int kc_pad, int mr, uint8_t* dst) {
-    detail::pack_a_vnni(a, i0, k0, mc, kc, kc_pad, mr, dst);
+    gemm::threadblock::pack_a_vnni(a, i0, k0, mc, kc, kc_pad, mr, dst);
   }
 
   template <typename LayoutB>
   static void pack_b(TensorRef<const int8_t, LayoutB> b, int k0, int j0, int kc, int kc_pad,
                      int nc, int nr, int8_t* dst) {
-    detail::pack_b_vnni(b, k0, j0, kc, kc_pad, nc, nr, reinterpret_cast<uint8_t*>(dst));
+    gemm::threadblock::pack_b_vnni(b, k0, j0, kc, kc_pad, nc, nr,
+                                   reinterpret_cast<uint8_t*>(dst));
   }
 };
 

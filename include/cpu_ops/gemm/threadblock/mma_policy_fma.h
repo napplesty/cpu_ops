@@ -14,9 +14,9 @@
 // Packed panels are laid out per micro-tile strip: strip s covers
 // kc_pad * MR (A) resp. kc_pad * NR (B) contiguous elements.
 
-#include "cpu_ops/detail/mma_atom.h"
-#include "cpu_ops/detail/pack.h"
-#include "cpu_ops/layout.h"
+#include "cpu_ops/arch/mma_atom.h"
+#include "cpu_ops/gemm/threadblock/pack.h"
+#include "cpu_ops/tensor_ref.h"
 
 namespace cpu_ops {
 namespace mma {
@@ -40,13 +40,13 @@ struct FmaPolicy {
   template <typename LayoutA>
   static void pack_a(TensorRef<const T, LayoutA> a, int i0, int k0, int mc, int kc,
                      int /*kc_pad*/, int mr, T* dst) {
-    detail::pack_a(a, i0, k0, mc, kc, mr, dst);
+    gemm::threadblock::pack_a(a, i0, k0, mc, kc, mr, dst);
   }
 
   template <typename LayoutB>
   static void pack_b(TensorRef<const T, LayoutB> b, int k0, int j0, int kc, int /*kc_pad*/,
                      int nc, int nr, T* dst) {
-    detail::pack_b(b, k0, j0, kc, nc, nr, dst);
+    gemm::threadblock::pack_b(b, k0, j0, kc, nc, nr, dst);
   }
 };
 

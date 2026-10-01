@@ -106,7 +106,9 @@ struct Lab<bfloat16_t> {
   static const char* name() { return "bf16"; }
 };
 
-template <typename StorageT, typename LA, typename LB, typename LC>
+template <typename StorageT, typename LA, typename LB, typename LC,
+          typename Config = cpu_ops::gemm::device::GemmConfig<float>,
+          typename Policy = cpu_ops::mma::WidenPolicy<StorageT>>
 void run_case(int m, int n, int k, float alpha, float beta, int num_threads) {
   ++g_cases;
   const int lda = (LA::kIsRowMajor ? k : m) + 3;
@@ -154,8 +156,7 @@ void run_case(int m, int n, int k, float alpha, float beta, int num_threads) {
 
   using Gemm = cpu_ops::gemm::device::Gemm<
       StorageT, LA, StorageT, LB, float, LC, float,
-      cpu_ops::epilogue::LinearCombination<float>, cpu_ops::gemm::device::GemmConfig<float>,
-      cpu_ops::mma::WidenPolicy<StorageT>>;
+      cpu_ops::epilogue::LinearCombination<float>, Config, Policy>;
   typename Gemm::Arguments args{{m, n, k},
                                 {A.data(), lda},
                                 {B.data(), ldb},
@@ -198,7 +199,9 @@ void run_all_layouts(int m, int n, int k, float alpha, float beta, int num_threa
 }
 
 // Forced split-k through the widening path (slice counts not dividing k).
-template <typename StorageT>
+template <typename StorageT,
+          typename Config = cpu_ops::gemm::device::GemmConfig<float>,
+          typename Policy = cpu_ops::mma::WidenPolicy<StorageT>>
 void check_splitk(int num_threads) {
   using cpu_ops::layout::RowMajor;
   const int m = 24, n = 40, k = 3000;
@@ -214,8 +217,7 @@ void check_splitk(int num_threads) {
 
   using Gemm = cpu_ops::gemm::device::Gemm<
       StorageT, RowMajor, StorageT, RowMajor, float, RowMajor, float,
-      cpu_ops::epilogue::LinearCombination<float>, cpu_ops::gemm::device::GemmConfig<float>,
-      cpu_ops::mma::WidenPolicy<StorageT>>;
+      cpu_ops::epilogue::LinearCombination<float>, Config, Policy>;
   Gemm op;
   typename Gemm::Arguments args{{m, n, k},
                                 {A.data(), lda},
@@ -276,6 +278,25 @@ int main() {
   }
   check_splitk<float16_t>(8);
   check_splitk<bfloat16_t>(8);
+
+  // The bf16 dot-product policy (GemmBF16F32's default on AVX512-BF16
+  // targets), exercised explicitly so it is covered on every host through
+  // its portable two-FMA dpbf16ps fallback.
+  {
+    using cpu_ops::layout::ColumnMajor;
+    using cpu_ops::layout::RowMajor;
+    using cpu_ops::mma::Bf16GemmConfig;
+    using cpu_ops::mma::Bf16Policy;
+    for (const ShapeCfg& s : shapes) {
+      for (int threads : {1, 8}) {
+        run_case<bfloat16_t, RowMajor, RowMajor, RowMajor, Bf16GemmConfig, Bf16Policy>(
+            s.m, s.n, s.k, 1.0f, 0.0f, threads);
+        run_case<bfloat16_t, ColumnMajor, ColumnMajor, ColumnMajor, Bf16GemmConfig,
+                 Bf16Policy>(s.m, s.n, s.k, 2.0f, -0.5f, threads);
+      }
+    }
+    check_splitk<bfloat16_t, Bf16GemmConfig, Bf16Policy>(8);
+  }
 
   std::printf("test_gemm_f16: %d cases, %d failures\n", g_cases, g_failures);
   return g_failures == 0 ? 0 : 1;

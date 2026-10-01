@@ -13,19 +13,25 @@
 // Decode is vectorized where possible: e4m3/e5m2 bit patterns map into f16
 // by shifts (exact, denormals included; e4m3 carries a fixed 2^-8 bias that
 // is folded into the block scale) and convert with F16C; e2m1 decodes
-// through a pshufb table of f16 high bytes. Scalar table fallback otherwise.
+// through a pshufb table of f16 high bytes. With AVX512F the same tricks run
+// 16 elements wide through _mm512_cvtph_ps. Scalar table fallback otherwise.
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
 
-#include "cpu_ops/detail/mma_atom.h"
+#include "cpu_ops/arch/mma_atom.h"
 #include "cpu_ops/mx_formats.h"
 
 #if defined(__AVX2__) && defined(__F16C__) && !defined(CPU_OPS_FORCE_SCALAR)
 #include <immintrin.h>
 #define CPU_OPS_MX_SIMD_DECODE 1
+#if defined(__AVX512F__)
+// 16-wide decode: same bit tricks widened to f16x16, converted by
+// _mm512_cvtph_ps (AVX512F). Bit-identical to the scalar decode.
+#define CPU_OPS_MX_SIMD_DECODE_512 1
+#endif
 #endif
 
 namespace cpu_ops {
@@ -57,10 +63,27 @@ struct traits<fp8e4m3_t> {
     // |v| == 0x7F is NaN in e4m3 but decodes to a normal f16 above; remap.
     const __m128i nan8 = _mm_cmpeq_epi8(_mm_and_si128(b, _mm_set1_epi8(0x7F)),
                                         _mm_set1_epi8(0x7F));
-    const __m128i nan16 = _mm_cvtepu8_epi16(nan8);
+    const __m128i nan16 = _mm_cvtepi8_epi16(nan8);
     h = _mm_or_si128(h, _mm_and_si128(nan16, _mm_set1_epi16(0x7E00)));
     return _mm256_cvtph_ps(h);
   }
+#ifdef CPU_OPS_MX_SIMD_DECODE_512
+  // 16 consecutive elements at byte offset k (k+16 must not pass the row end).
+  static __m512 decode16(const uint8_t* row, int k) {
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + k));
+    const __m256i w = _mm256_cvtepu8_epi16(b);
+    const __m256i sign =
+        _mm256_slli_epi16(_mm256_and_si256(w, _mm256_set1_epi16(0x80)), 8);
+    const __m256i body =
+        _mm256_and_si256(_mm256_slli_epi16(w, 7), _mm256_set1_epi16(0x3F80));
+    __m256i h = _mm256_or_si256(sign, body);
+    const __m128i nan8 = _mm_cmpeq_epi8(_mm_and_si128(b, _mm_set1_epi8(0x7F)),
+                                        _mm_set1_epi8(0x7F));
+    const __m256i nan16 = _mm256_cvtepi8_epi16(nan8);
+    h = _mm256_or_si256(h, _mm256_and_si256(nan16, _mm256_set1_epi16(0x7E00)));
+    return _mm512_cvtph_ps(h);
+  }
+#endif
 #endif
 };
 
@@ -79,6 +102,17 @@ struct traits<fp8e5m2_t> {
     const __m128i body = _mm_and_si128(_mm_slli_epi16(w, 8), _mm_set1_epi16(0x7F00));
     return _mm256_cvtph_ps(_mm_or_si128(sign, body));
   }
+#ifdef CPU_OPS_MX_SIMD_DECODE_512
+  static __m512 decode16(const uint8_t* row, int k) {
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + k));
+    const __m256i w = _mm256_cvtepu8_epi16(b);
+    const __m256i sign =
+        _mm256_slli_epi16(_mm256_and_si256(w, _mm256_set1_epi16(0x80)), 8);
+    const __m256i body =
+        _mm256_and_si256(_mm256_slli_epi16(w, 8), _mm256_set1_epi16(0x7F00));
+    return _mm512_cvtph_ps(_mm256_or_si256(sign, body));
+  }
+#endif
 #endif
 };
 
@@ -109,6 +143,27 @@ struct traits<fp4e2m1_t> {
     const __m128i hib = _mm_shuffle_epi8(table, idx);
     return _mm256_cvtph_ps(_mm_unpacklo_epi8(_mm_setzero_si128(), hib));
   }
+#ifdef CPU_OPS_MX_SIMD_DECODE_512
+  // 16 consecutive elements; k must be even (reads the 8 bytes at k/2).
+  static __m512 decode16(const uint8_t* row, int k) {
+    uint64_t packed8;
+    std::memcpy(&packed8, row + (k >> 1), 8);
+    const __m128i v = _mm_cvtsi64_si128(static_cast<long long>(packed8));
+    const __m128i lo = _mm_and_si128(v, _mm_set1_epi8(0x0F));
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+    const __m128i idx = _mm_unpacklo_epi8(lo, hi);  // all 16 elements in order
+    const __m128i table =
+        _mm_setr_epi8(0x00, 0x38, 0x3C, 0x3E, 0x40, 0x42, 0x44, 0x46,
+                      static_cast<char>(0x80), static_cast<char>(0xB8),
+                      static_cast<char>(0xBC), static_cast<char>(0xBE),
+                      static_cast<char>(0xC0), static_cast<char>(0xC2),
+                      static_cast<char>(0xC4), static_cast<char>(0xC6));
+    const __m128i hib = _mm_shuffle_epi8(table, idx);
+    // widen, then place each looked-up byte into the f16 high byte.
+    const __m256i h = _mm256_slli_epi16(_mm256_cvtepu8_epi16(hib), 8);
+    return _mm512_cvtph_ps(h);
+  }
+#endif
 #endif
 };
 
@@ -135,6 +190,14 @@ inline void decode_segment(const uint8_t* row, int kk0, int len, float scale, fl
     // fp4: step to an even element index so decode8 sees aligned nibble pairs.
     for (; t < len && ((kk0 + t) & 1); ++t) out[t * stride] = Tr::decode(row, kk0 + t) * scale;
   }
+#ifdef CPU_OPS_MX_SIMD_DECODE_512
+  const __m512 vs16 = _mm512_set1_ps(s8);
+  for (; t + 16 <= len; t += 16) {
+    alignas(64) float tmp[16];
+    _mm512_store_ps(tmp, _mm512_mul_ps(Tr::decode16(row, kk0 + t), vs16));
+    for (int u = 0; u < 16; ++u) out[(t + u) * stride] = tmp[u];
+  }
+#endif
   const __m256 vs = _mm256_set1_ps(s8);
   for (; t + 8 <= len; t += 8) {
     alignas(32) float tmp[8];
@@ -239,6 +302,9 @@ struct MxPolicy {
 }  // namespace mma
 }  // namespace cpu_ops
 
+#if defined(CPU_OPS_MX_SIMD_DECODE_512)
+#undef CPU_OPS_MX_SIMD_DECODE_512
+#endif
 #if defined(CPU_OPS_MX_SIMD_DECODE)
 #undef CPU_OPS_MX_SIMD_DECODE
 #endif

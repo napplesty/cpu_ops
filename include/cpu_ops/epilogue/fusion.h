@@ -21,7 +21,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "cpu_ops/detail/simd.h"
+#include "cpu_ops/arch/simd.h"
 
 namespace cpu_ops {
 namespace epilogue {

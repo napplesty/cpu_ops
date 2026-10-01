@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cpu_ops/detail/simd.h"
+#include "cpu_ops/arch/simd.h"
 
 namespace cpu_ops {
 namespace mma {

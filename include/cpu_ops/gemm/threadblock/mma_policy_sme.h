@@ -9,12 +9,13 @@
 //
 // Build requirements: aarch64, GCC 14+ or Clang 18+,
 //   -march=armv9.2-a+sme -msve-vector-bits=<128|256|512|...>
-// The whole header is inert unless __ARM_FEATURE_SME is defined together with
-// a fixed SVE vector width.
+// The library is header-only, so the SME kernel is instantiated in the
+// consumer's translation unit. The whole header is inert unless
+// __ARM_FEATURE_SME is defined together with a fixed SVE vector width.
 
-#include "cpu_ops/detail/pack.h"
-#include "cpu_ops/detail/simd.h"
-#include "cpu_ops/layout.h"
+#include "cpu_ops/arch/simd.h"
+#include "cpu_ops/gemm/threadblock/pack.h"
+#include "cpu_ops/tensor_ref.h"
 
 #if defined(CPU_OPS_SIMD_SVE) && defined(__ARM_FEATURE_SME)
 #define CPU_OPS_HAS_SME_POLICY 1
@@ -76,13 +77,13 @@ struct SmePolicyF32 {
   template <typename LayoutA>
   static void pack_a(TensorRef<const float, LayoutA> a, int i0, int k0, int mc, int kc,
                      int /*kc_pad*/, int mr, float* dst) {
-    detail::pack_a(a, i0, k0, mc, kc, mr, dst);
+    gemm::threadblock::pack_a(a, i0, k0, mc, kc, mr, dst);
   }
 
   template <typename LayoutB>
   static void pack_b(TensorRef<const float, LayoutB> b, int k0, int j0, int kc,
                      int /*kc_pad*/, int nc, int nr, float* dst) {
-    detail::pack_b(b, k0, j0, kc, nc, nr, dst);
+    gemm::threadblock::pack_b(b, k0, j0, kc, nc, nr, dst);
   }
 };
 

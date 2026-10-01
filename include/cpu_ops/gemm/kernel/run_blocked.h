@@ -1,26 +1,27 @@
 #pragma once
 
-// Definitions for cpu_ops::gemm::device::Gemm and GemmMx. The library
-// instantiates the standard combinations in its own translation units;
-// include this header only to instantiate custom epilogues, tile
-// configurations, or mma policies.
+// Kernel-layer orchestration behind gemm::device::Gemm and GemmMx: thread
+// partition, optional split-k two-phase execution, per-task packing buffers.
+// Operand references are forwarded opaquely to the policy's pack functions
+// (TensorRef for dense operands, MxTensorRef for block-scaled ones).
 
 #include <algorithm>
 #include <cstddef>
 #include <new>
-#include <type_traits>
+#include <vector>
 
-#include "cpu_ops/detail/block_gemm.h"
-#include "cpu_ops/detail/simd.h"
-#include "cpu_ops/detail/thread_pool.h"
-#include "cpu_ops/detail/thread_swizzle.h"
+#include "cpu_ops/arch/simd.h"
 #include "cpu_ops/epilogue/partial_sum.h"
-#include "cpu_ops/gemm/device/gemm.h"
-#include "cpu_ops/gemm/device/gemm_mx.h"
+#include "cpu_ops/gemm/threadblock/block_gemm.h"
+#include "cpu_ops/gemm/threadblock/threadblock_swizzle.h"
+#include "cpu_ops/layout/matrix.h"
+#include "cpu_ops/status.h"
+#include "cpu_ops/tensor_ref.h"
+#include "cpu_ops/thread/thread_pool.h"
 
 namespace cpu_ops {
 namespace gemm {
-namespace device {
+namespace kernel {
 
 namespace detail {
 
@@ -34,7 +35,8 @@ inline void reduce_splitk(TensorRef<const T, LayoutC> c, TensorRef<T, LayoutC> d
   constexpr int kV = simd::native_width<T>();
   using VecT = simd::Vec<T, kV>;
   const size_t slab = static_cast<size_t>(m) * n;
-  if constexpr (LayoutC::kIsRowMajor && gemm::epilogue_has_apply_vec<Epilogue, VecT>::value) {
+  if constexpr (LayoutC::kIsRowMajor &&
+                threadblock::epilogue_has_apply_vec<Epilogue, VecT>::value) {
     for (int i = 0; i < m; ++i) {
       const T* wrow = ws + static_cast<size_t>(i) * n;
       const T* crow = c.data() + LayoutC::offset(i, 0, c.ld());
@@ -63,10 +65,8 @@ inline void reduce_splitk(TensorRef<const T, LayoutC> c, TensorRef<T, LayoutC> d
   }
 }
 
-// Shared orchestration behind Gemm and GemmMx: thread partition, optional
-// split-k two-phase execution, per-task packing buffers. Operand references
-// are forwarded opaquely to the policy's pack functions (TensorRef for dense
-// operands, MxTensorRef for block-scaled ones).
+}  // namespace detail
+
 template <typename Policy, typename LayoutC, typename Epilogue, typename Config,
           typename RefA, typename RefB>
 Status run_blocked(const RefA& a, const RefB& b,
@@ -119,10 +119,10 @@ Status run_blocked(const RefA& a, const RefB& b,
     k_slices = std::max(1, std::min(k_slices, depth_cap));
   }
 
-  const std::vector<GemmRegion> regions =
-      partition_gemm(m, n, k, Config::kMR, Config::kNR, p, k_slices);
+  const std::vector<threadblock::GemmRegion> regions =
+      threadblock::partition_gemm(m, n, k, Config::kMR, Config::kNR, p, k_slices);
 
-  using Block = BlockGemm<Policy, LayoutC, Epilogue, Config>;
+  using Block = threadblock::BlockGemm<Policy, LayoutC, Epilogue, Config>;
   using PackedA = typename Policy::PackedA;
   using PackedB = typename Policy::PackedB;
   constexpr int kKCPadded = Policy::pad_kc(Config::kKC);
@@ -135,7 +135,7 @@ Status run_blocked(const RefA& a, const RefB& b,
     // Phase 1: every region reduces its k slice into its own partial-sum slab
     // (row-major, no epilogue applied yet).
     using WsEpilogue = epilogue::PartialSum<T>;
-    using BlockWs = BlockGemm<Policy, layout::RowMajor, WsEpilogue, Config>;
+    using BlockWs = threadblock::BlockGemm<Policy, layout::RowMajor, WsEpilogue, Config>;
     const std::size_t slab_elems = static_cast<std::size_t>(m) * n;
     T* ws = static_cast<T*>(::operator new(slab_elems * k_slices * sizeof(T),
                                            std::align_val_t(64)));
@@ -144,7 +144,7 @@ Status run_blocked(const RefA& a, const RefB& b,
           ::operator new(buf_a_elems * sizeof(PackedA), std::align_val_t(64)));
       PackedB* buf_b = static_cast<PackedB*>(
           ::operator new(buf_b_elems * sizeof(PackedB), std::align_val_t(64)));
-      const GemmRegion& r = regions[static_cast<size_t>(task)];
+      const threadblock::GemmRegion& r = regions[static_cast<size_t>(task)];
       T* slab_ptr = ws + static_cast<size_t>(r.slice) * slab_elems;
       TensorRef<T, layout::RowMajor> slab(slab_ptr, n);
       TensorRef<const T, layout::RowMajor> slab_c(slab_ptr, n);
@@ -165,7 +165,7 @@ Status run_blocked(const RefA& a, const RefB& b,
         ::operator new(buf_a_elems * sizeof(PackedA), std::align_val_t(64)));
     PackedB* buf_b = static_cast<PackedB*>(
         ::operator new(buf_b_elems * sizeof(PackedB), std::align_val_t(64)));
-    const GemmRegion& r = regions[static_cast<size_t>(task)];
+    const threadblock::GemmRegion& r = regions[static_cast<size_t>(task)];
     Block::run(a, b, c, d, r.m0, r.m1, r.n0, r.n1,
                r.k0, r.k1, epilogue, buf_a, buf_b);
     ::operator delete(buf_a, std::align_val_t(64));
@@ -180,107 +180,6 @@ Status run_blocked(const RefA& a, const RefB& b,
   return Status::kSuccess;
 }
 
-}  // namespace detail
-
-template <typename ElementA, typename LayoutA, typename ElementB, typename LayoutB,
-          typename ElementC, typename LayoutC, typename ElementAccumulator, typename Epilogue,
-          typename Config, typename MmaPolicy>
-Status Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC, ElementAccumulator,
-            Epilogue, Config, MmaPolicy>::operator()(const Arguments& args,
-                                                     int num_threads) const {
-  static_assert(std::is_same<ElementA, typename MmaPolicy::ElemA>::value &&
-                    std::is_same<ElementB, typename MmaPolicy::ElemB>::value &&
-                    std::is_same<ElementAccumulator, typename MmaPolicy::AccT>::value &&
-                    std::is_same<ElementC, typename MmaPolicy::AccT>::value,
-                "element types must match the mma policy's ElemA/ElemB, and both the "
-                "accumulator and C must use the policy's AccT");
-
-  const int m = args.problem_size.m;
-  const int n = args.problem_size.n;
-  const int k = args.problem_size.k;
-  if (m < 0 || n < 0 || k < 0) return Status::kErrorInvalidProblem;
-  if (m == 0 || n == 0) return Status::kSuccess;
-
-  if (k == 0) {
-    // Degenerate product: fold beta * C into D without touching A or B
-    // (which are allowed to be empty in this case).
-    const Epilogue epilogue(args.epilogue);
-    for (int i = 0; i < m; ++i) {
-      for (int j = 0; j < n; ++j) {
-        args.ref_D.at(i, j) = epilogue(ElementC(0), args.ref_C.at(i, j), true, true, i, j);
-      }
-    }
-    return Status::kSuccess;
-  }
-
-  if (!args.ref_A.data() || !args.ref_B.data() || !args.ref_C.data() || !args.ref_D.data()) {
-    return Status::kErrorInvalidArguments;
-  }
-  const int lda_min = LayoutA::kIsRowMajor ? k : m;
-  const int ldb_min = LayoutB::kIsRowMajor ? n : k;
-  const int ldc_min = LayoutC::kIsRowMajor ? n : m;
-  const int ldd_min = ldc_min;
-  if (args.ref_A.ld() < lda_min || args.ref_B.ld() < ldb_min || args.ref_C.ld() < ldc_min ||
-      args.ref_D.ld() < ldd_min) {
-    return Status::kErrorInvalidArguments;
-  }
-
-  return detail::run_blocked<MmaPolicy, LayoutC, Epilogue, Config>(
-      args.ref_A, args.ref_B, args.ref_C, args.ref_D, m, n, k, args.epilogue,
-      args.split_k_slices, num_threads);
-}
-
-template <typename StorageA, typename StorageB, typename LayoutC, typename Epilogue,
-          typename Config>
-Status GemmMx<StorageA, StorageB, LayoutC, Epilogue, Config>::operator()(
-    const Arguments& args, int num_threads) const {
-  const int m = args.problem_size.m;
-  const int n = args.problem_size.n;
-  const int k = args.problem_size.k;
-  if (m < 0 || n < 0 || k < 0) return Status::kErrorInvalidProblem;
-  if (m == 0 || n == 0) return Status::kSuccess;
-
-  if (k == 0) {
-    // Degenerate product: fold beta * C into D without touching A or B.
-    const Epilogue epilogue(args.epilogue);
-    for (int i = 0; i < m; ++i) {
-      for (int j = 0; j < n; ++j) {
-        args.ref_D.at(i, j) = epilogue(0.0f, args.ref_C.at(i, j), true, true, i, j);
-      }
-    }
-    return Status::kSuccess;
-  }
-
-  const MxTensorRef<StorageA>& a = args.ref_A;
-  const MxTensorRef<StorageB>& b = args.ref_B;
-  if (!a.data || !a.scales || !b.data || !b.scales || !args.ref_C.data() ||
-      !args.ref_D.data()) {
-    return Status::kErrorInvalidArguments;
-  }
-  // Both operands are contiguous along k: ld counts elements along k for A
-  // (m x k row-major) and along k for B (k x n column-major). Scale arrays
-  // follow the same layout with ceil(k / 32) entries per row/column.
-  const int scale_ld_min = (k + 31) / 32;
-  if (a.ld < k || b.ld < k || a.ld_scales < scale_ld_min ||
-      b.ld_scales < scale_ld_min) {
-    return Status::kErrorInvalidArguments;
-  }
-  // fp4 packs two elements per byte; a row must start on a byte boundary.
-  if ((mma::mx_detail2::traits<StorageA>::kLog2ElemsPerByte > 0 && (a.ld & 1)) ||
-      (mma::mx_detail2::traits<StorageB>::kLog2ElemsPerByte > 0 && (b.ld & 1))) {
-    return Status::kErrorInvalidArguments;
-  }
-  const int ldc_min = LayoutC::kIsRowMajor ? n : m;
-  if (args.ref_C.ld() < ldc_min || args.ref_D.ld() < ldc_min) {
-    return Status::kErrorInvalidArguments;
-  }
-
-  using Policy = mma::MxPolicy<StorageA, StorageB>;
-  return detail::run_blocked<Policy, LayoutC, Epilogue, Config>(
-      a, b, args.ref_C, args.ref_D, m, n, k, args.epilogue, args.split_k_slices,
-      num_threads);
-}
-
-}  // namespace device
+}  // namespace kernel
 }  // namespace gemm
 }  // namespace cpu_ops

@@ -12,6 +12,12 @@
 #if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
 #define CPU_OPS_SIMD_VNNI 1
 #endif
+#if defined(__AVX512F__)
+#define CPU_OPS_SIMD_AVX512F 1
+#if defined(__AVX512BF16__)
+#define CPU_OPS_SIMD_AVX512BF16 1
+#endif
+#endif
 #elif defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE_BITS)
 // Fixed-width SVE/SVE2 build (-msve-vector-bits=N): SVE types get a static
 // size and can live in structs, so the Vec<T, N> template maps onto them.
@@ -128,9 +134,31 @@ inline Vec<int32_t, N> dpbusd(Vec<int32_t, N> acc, Vec<int32_t, N> a, Vec<int32_
   return acc;
 }
 
+// 2-way bf16 dot product accumulated per f32 lane: each lane's 32 bits hold
+// two packed bf16 k-slices (low half = the even k, high half = k + 1). The
+// products are exact in f32 (8-bit mantissas), matching vdpbf16ps semantics
+// up to the two rounding steps (acc + p_lo) + p_hi.
+template <int N>
+inline Vec<float, N> dpbf16ps(Vec<float, N> acc, Vec<float, N> a, Vec<float, N> b) {
+  for (int l = 0; l < N; ++l) {
+    uint32_t av, bv;
+    std::memcpy(&av, &a.v[l], 4);
+    std::memcpy(&bv, &b.v[l], 4);
+    const uint32_t a0 = av << 16, a1 = av & 0xFFFF0000u;
+    const uint32_t b0 = bv << 16, b1 = bv & 0xFFFF0000u;
+    float fa0, fa1, fb0, fb1;
+    std::memcpy(&fa0, &a0, 4);
+    std::memcpy(&fa1, &a1, 4);
+    std::memcpy(&fb0, &b0, 4);
+    std::memcpy(&fb1, &b1, 4);
+    acc.v[l] = std::fma(fa1, fb1, std::fma(fa0, fb0, acc.v[l]));
+  }
+  return acc;
+}
+
 // ---- Narrow → f32 widening loads -----------------------------------------
 // Raw 16-bit layouts only (IEEE binary16; bfloat16 is the high half of a
-// binary32), so these stay independent of element_types.h. ISA sections
+// binary32), so these stay independent of numeric_types.h. ISA sections
 // below override the generic versions with single-instruction converts.
 
 inline float f16_bits_to_f32(uint16_t h) {
@@ -372,6 +400,20 @@ inline Vec<float, 8> min(const Vec<float, 8>& a, const Vec<float, 8>& b) {
   return _mm256_min_ps(a.v, b.v);
 }
 
+// acc + a·b per f32 lane over packed bf16 pairs (see the generic dpbf16ps):
+// the bf16 halves widen to f32 by placing them in the high 16 bits.
+inline Vec<float, 8> dpbf16ps(Vec<float, 8> acc, Vec<float, 8> a, Vec<float, 8> b) {
+  const __m256i ai = _mm256_castps_si256(a.v);
+  const __m256i bi = _mm256_castps_si256(b.v);
+  const __m256i himask = _mm256_set1_epi32(static_cast<int32_t>(0xFFFF0000u));
+  const __m256 a0 = _mm256_castsi256_ps(_mm256_slli_epi32(ai, 16));
+  const __m256 a1 = _mm256_castsi256_ps(_mm256_and_si256(ai, himask));
+  const __m256 b0 = _mm256_castsi256_ps(_mm256_slli_epi32(bi, 16));
+  const __m256 b1 = _mm256_castsi256_ps(_mm256_and_si256(bi, himask));
+  acc.v = _mm256_fmadd_ps(a1, b1, _mm256_fmadd_ps(a0, b0, acc.v));
+  return acc;
+}
+
 // exp2: round-to-nearest integer exponent (magic-add trick) + degree-6
 // minimax polynomial for 2^r on [-0.5, 0.5], relative error ~1e-7. Inputs are
 // clamped so extreme arguments flush to ~0 / +inf instead of corrupting the
@@ -478,6 +520,71 @@ inline Vec<int32_t, 8> min(const Vec<int32_t, 8>& a, const Vec<int32_t, 8>& b) {
 
 #endif  // CPU_OPS_SIMD_VNNI
 #endif  // CPU_OPS_SIMD_AVX2
+
+#if defined(CPU_OPS_SIMD_AVX512F)
+
+// 512-bit f32 vector. Deliberately NOT wired into native_width<T>() (which
+// stays at the AVX2 width so the f32/f64 mainloop and the ops layer keep
+// their tuned tile shapes); used explicitly by the AVX512-BF16 mma policy.
+template <>
+struct Vec<float, 16> {
+  __m512 v;
+  Vec() = default;
+  Vec(__m512 x) : v(x) {}  // implicit on purpose
+  static Vec load(const float* p) { return _mm512_loadu_ps(p); }
+  static Vec set1(float x) { return _mm512_set1_ps(x); }
+  // Broadcasts a raw 32-bit pattern into every lane (bf16 pair dot-product
+  // path: each lane receives the same packed bf16 pair).
+  static Vec set1_u32(uint32_t x) {
+    return _mm512_castsi512_ps(_mm512_set1_epi32(static_cast<int32_t>(x)));
+  }
+  void store(float* p) const { _mm512_storeu_ps(p, v); }
+};
+
+inline Vec<float, 16> fmadd(const Vec<float, 16>& a, const Vec<float, 16>& b,
+                            const Vec<float, 16>& c) {
+  return _mm512_fmadd_ps(a.v, b.v, c.v);
+}
+inline Vec<float, 16> mul(const Vec<float, 16>& a, const Vec<float, 16>& b) {
+  return _mm512_mul_ps(a.v, b.v);
+}
+inline Vec<float, 16> add(const Vec<float, 16>& a, const Vec<float, 16>& b) {
+  return _mm512_add_ps(a.v, b.v);
+}
+inline Vec<float, 16> sub(const Vec<float, 16>& a, const Vec<float, 16>& b) {
+  return _mm512_sub_ps(a.v, b.v);
+}
+inline Vec<float, 16> max(const Vec<float, 16>& a, const Vec<float, 16>& b) {
+  return _mm512_max_ps(a.v, b.v);
+}
+inline Vec<float, 16> min(const Vec<float, 16>& a, const Vec<float, 16>& b) {
+  return _mm512_min_ps(a.v, b.v);
+}
+
+#if defined(CPU_OPS_SIMD_AVX512BF16)
+// acc + a·b per f32 lane over packed bf16 pairs (see the generic dpbf16ps).
+inline Vec<float, 16> dpbf16ps(Vec<float, 16> acc, Vec<float, 16> a, Vec<float, 16> b) {
+  acc.v = _mm512_dpbf16_ps(acc.v, (__m512bh)_mm512_castps_si512(a.v),
+                           (__m512bh)_mm512_castps_si512(b.v));
+  return acc;
+}
+#else
+// AVX512F without BF16 (e.g. Ice Lake): same semantics via shifts and two
+// FMAs — the bf16 halves widen to f32 by placing them in the high 16 bits.
+inline Vec<float, 16> dpbf16ps(Vec<float, 16> acc, Vec<float, 16> a, Vec<float, 16> b) {
+  const __m512i ai = _mm512_castps_si512(a.v);
+  const __m512i bi = _mm512_castps_si512(b.v);
+  const __m512i himask = _mm512_set1_epi32(static_cast<int32_t>(0xFFFF0000u));
+  const __m512 a0 = _mm512_castsi512_ps(_mm512_slli_epi32(ai, 16));
+  const __m512 a1 = _mm512_castsi512_ps(_mm512_and_si512(ai, himask));
+  const __m512 b0 = _mm512_castsi512_ps(_mm512_slli_epi32(bi, 16));
+  const __m512 b1 = _mm512_castsi512_ps(_mm512_and_si512(bi, himask));
+  acc.v = _mm512_fmadd_ps(a1, b1, _mm512_fmadd_ps(a0, b0, acc.v));
+  return acc;
+}
+#endif  // CPU_OPS_SIMD_AVX512BF16
+
+#endif  // CPU_OPS_SIMD_AVX512F
 
 #if defined(CPU_OPS_SIMD_SVE)
 
@@ -621,6 +728,20 @@ inline Vec<float, 4> min(const Vec<float, 4>& a, const Vec<float, 4>& b) {
   return vminq_f32(a.v, b.v);
 }
 
+// acc + a·b per f32 lane over packed bf16 pairs (see the generic dpbf16ps):
+// the bf16 halves widen to f32 by placing them in the high 16 bits.
+inline Vec<float, 4> dpbf16ps(Vec<float, 4> acc, Vec<float, 4> a, Vec<float, 4> b) {
+  const uint32x4_t ai = vreinterpretq_u32_f32(a.v);
+  const uint32x4_t bi = vreinterpretq_u32_f32(b.v);
+  const uint32x4_t himask = vdupq_n_u32(0xFFFF0000u);
+  const float32x4_t a0 = vreinterpretq_f32_u32(vshlq_n_u32(ai, 16));
+  const float32x4_t a1 = vreinterpretq_f32_u32(vandq_u32(ai, himask));
+  const float32x4_t b0 = vreinterpretq_f32_u32(vshlq_n_u32(bi, 16));
+  const float32x4_t b1 = vreinterpretq_f32_u32(vandq_u32(bi, himask));
+  acc.v = vfmaq_f32(vfmaq_f32(acc.v, a0, b0), a1, b1);
+  return acc;
+}
+
 // exp2, same scheme as the AVX2 version (round-to-nearest-even exponent via
 // vcvtnq + degree-6 polynomial on [-0.5, 0.5], inputs clamped).
 template <>
@@ -651,6 +772,54 @@ inline float hsum(const Vec<float, 4>& x) {
   return vaddvq_f32(x.v);
 }
 #endif  // __aarch64__
+
+// int32 vector for the quantized GEMM path (VnniPolicy works unchanged on
+// NEON once this and dpbusd below exist).
+template <>
+struct Vec<int32_t, 4> {
+  int32x4_t v;
+  Vec() = default;
+  Vec(int32x4_t x) : v(x) {}  // implicit on purpose
+  static Vec load(const int32_t* p) { return vld1q_s32(p); }
+  static Vec set1(int32_t x) { return vdupq_n_s32(x); }
+  static Vec set1_u32(uint32_t x) { return vreinterpretq_s32_u32(vdupq_n_u32(x)); }
+  void store(int32_t* p) const { vst1q_s32(p, v); }
+};
+
+inline Vec<int32_t, 4> mul(const Vec<int32_t, 4>& a, const Vec<int32_t, 4>& b) {
+  return vmulq_s32(a.v, b.v);
+}
+inline Vec<int32_t, 4> add(const Vec<int32_t, 4>& a, const Vec<int32_t, 4>& b) {
+  return vaddq_s32(a.v, b.v);
+}
+inline Vec<int32_t, 4> max(const Vec<int32_t, 4>& a, const Vec<int32_t, 4>& b) {
+  return vmaxq_s32(a.v, b.v);
+}
+inline Vec<int32_t, 4> min(const Vec<int32_t, 4>& a, const Vec<int32_t, 4>& b) {
+  return vminq_s32(a.v, b.v);
+}
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+// Exact u8 x s8 -> s32 4-way dot product in one instruction (ARMv8.6 i8mm).
+inline Vec<int32_t, 4> dpbusd(Vec<int32_t, 4> acc, Vec<int32_t, 4> a, Vec<int32_t, 4> b) {
+  acc.v = vusdotq_s32(acc.v, vreinterpretq_u8_s32(a.v), vreinterpretq_s8_s32(b.v));
+  return acc;
+}
+#elif defined(__ARM_FEATURE_DOTPROD)
+// u8 x s8 on plain dotprod (ARMv8.2, no i8mm) via a b-side bias:
+// with b' = b + 128 (u8, a single bit flip),  a·b  =  a·b' − 128·Σa  per
+// 4-byte group — the second term is one more udot against a ones vector.
+inline Vec<int32_t, 4> dpbusd(Vec<int32_t, 4> acc, Vec<int32_t, 4> a, Vec<int32_t, 4> b) {
+  const uint8x16_t au = vreinterpretq_u8_s32(a.v);
+  const uint8x16_t bb = veorq_u8(vreinterpretq_u8_s32(b.v), vdupq_n_u8(0x80));
+  const uint32x4_t dots = vdotq_u32(vdupq_n_u32(0), au, bb);
+  const uint32x4_t asum = vdotq_u32(vdupq_n_u32(0), au, vdupq_n_u8(1));
+  acc.v = vaddq_s32(
+      acc.v, vsubq_s32(vreinterpretq_s32_u32(dots),
+                       vreinterpretq_s32_u32(vshlq_n_u32(asum, 7))));
+  return acc;
+}
+#endif  // __ARM_FEATURE_DOTPROD (i8mm preferred above)
 
 #endif  // CPU_OPS_SIMD_NEON
 

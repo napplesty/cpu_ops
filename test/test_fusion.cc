@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "cpu_ops/gemm/device/gemm_fused.h"
-#include "cpu_ops/layout.h"
+#include "cpu_ops/layout/matrix.h"
 
 namespace {
 

@@ -9,13 +9,15 @@
 // usual "TN" arrangement for MX): scale blocks are contiguous 32-element
 // runs. Decoding happens at pack time; compute and accumulation are f32.
 
-#include "cpu_ops/detail/mma_policy_mx.h"
 #include "cpu_ops/epilogue/linear_combination.h"
 #include "cpu_ops/gemm/device/gemm.h"
-#include "cpu_ops/layout.h"
-#include "cpu_ops/matrix_shape.h"
+#include "cpu_ops/gemm/kernel/run_blocked.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_mx.h"
+#include "cpu_ops/gemm_coord.h"
+#include "cpu_ops/layout/matrix.h"
 #include "cpu_ops/mx_formats.h"
 #include "cpu_ops/status.h"
+#include "cpu_ops/tensor_ref.h"
 
 namespace cpu_ops {
 namespace gemm {
@@ -46,7 +48,53 @@ class GemmMx {
 
   GemmMx() = default;
 
-  Status operator()(const Arguments& args, int num_threads = 0) const;
+  Status operator()(const Arguments& args, int num_threads = 0) const {
+    const int m = args.problem_size.m;
+    const int n = args.problem_size.n;
+    const int k = args.problem_size.k;
+    if (m < 0 || n < 0 || k < 0) return Status::kErrorInvalidProblem;
+    if (m == 0 || n == 0) return Status::kSuccess;
+
+    if (k == 0) {
+      // Degenerate product: fold beta * C into D without touching A or B.
+      const Epilogue epilogue(args.epilogue);
+      for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) {
+          args.ref_D.at(i, j) = epilogue(0.0f, args.ref_C.at(i, j), true, true, i, j);
+        }
+      }
+      return Status::kSuccess;
+    }
+
+    const MxTensorRef<StorageA>& a = args.ref_A;
+    const MxTensorRef<StorageB>& b = args.ref_B;
+    if (!a.data || !a.scales || !b.data || !b.scales || !args.ref_C.data() ||
+        !args.ref_D.data()) {
+      return Status::kErrorInvalidArguments;
+    }
+    // Both operands are contiguous along k: ld counts elements along k for A
+    // (m x k row-major) and along k for B (k x n column-major). Scale arrays
+    // follow the same layout with ceil(k / 32) entries per row/column.
+    const int scale_ld_min = (k + 31) / 32;
+    if (a.ld < k || b.ld < k || a.ld_scales < scale_ld_min ||
+        b.ld_scales < scale_ld_min) {
+      return Status::kErrorInvalidArguments;
+    }
+    // fp4 packs two elements per byte; a row must start on a byte boundary.
+    if ((mma::mx_detail2::traits<StorageA>::kLog2ElemsPerByte > 0 && (a.ld & 1)) ||
+        (mma::mx_detail2::traits<StorageB>::kLog2ElemsPerByte > 0 && (b.ld & 1))) {
+      return Status::kErrorInvalidArguments;
+    }
+    const int ldc_min = LayoutC::kIsRowMajor ? n : m;
+    if (args.ref_C.ld() < ldc_min || args.ref_D.ld() < ldc_min) {
+      return Status::kErrorInvalidArguments;
+    }
+
+    using Policy = mma::MxPolicy<StorageA, StorageB>;
+    return kernel::run_blocked<Policy, LayoutC, Epilogue, Config>(
+        a, b, args.ref_C, args.ref_D, m, n, k, args.epilogue, args.split_k_slices,
+        num_threads);
+  }
 };
 
 // Convenience aliases for same-format operands.

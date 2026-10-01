@@ -1,12 +1,15 @@
 # cpu-ops
 
 CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17，无第三方依赖，
-按 `.h` 声明 + `.cc` 显式实例化组织，编译为静态库 `libcpu_ops.a`。
+纯头文件（header-only）CUTLASS 式分层模板库：包含即用，kernel 在使用方的编译单元内实例化。
 
 - f32 / f64 GEMM：FMA 主路径
-- int8 量化 GEMM（u8×s8→s32）：AVX-VNNI 点积指令
-- f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32
+- int8 量化 GEMM（u8×s8→s32）：AVX-VNNI 点积指令；ARM dotprod/i8mm；
+  AMX-INT8 瓦片 policy（实验性，opt-in）
+- f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32；AVX512-BF16 上 bf16
+  走 `vdpbf16ps` 原生点积（默认自动切换）
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
+  （AVX512F 上解码 16 路宽）
 - 组装式算子开发（CUTLASS 式）：fused attention（GQA/MHA/MQA）、MLA
   （DeepSeek 吸收式）、DSA（DeepSeek-V3.2 稀疏注意力）、CSA（NSA 式
   压缩稀疏注意力）与 KDA（Kimi Delta Attention，naive/chunk 双模式）
@@ -16,7 +19,7 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
   融合 epilogue 目录含 GeLU/SiLu
 - Split-K：深 k 自动切分 + 确定性两阶段归约
 - 融合 epilogue：alpha/beta 之后按位置融合的 op 链（ReLU / Clamp / BiasAdd / …）
-- ARM 支持：NEON / SVE2 定长 / SME（实验性）
+- ARM 支持：NEON / SVE2 定长 / SME（实验性）；int8 在 dotprod/i8mm 上自动启用
 - 任意平台均有标量回退；单线程与多线程结果**逐位一致**
 
 ## 构建
@@ -41,7 +44,7 @@ ctest --test-dir build          # 23 个测试：13 个核心（simd/gemm/int8/f
 main、目录级 `CMakeLists.txt` 与 README，并挂到 CTest（含标量回退构建）。这与
 CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head_attention`
 而非核心库。要实现自己的算子，照抄一个目录：包含
-`cpu_ops/detail/*` 原语头或相邻例子的头，在自己的编译单元里实例化。
+`cpu_ops/arch/*`、`cpu_ops/gemm/threadblock/*` 原语头或相邻例子的头，在自己的编译单元里实例化。
 
 - `examples/02_fused_attention/`：fused 块内核 + `Attention<T>` 入口
   （GQA/MHA/MQA，online softmax，causal 块跳过，decode KV-split；内核支持
@@ -63,7 +66,14 @@ CUTLASS 的做法一致——其 FMHA 同样位于 `examples/41_fused_multi_head
   slice 顺序归并，跨运行**逐位一致**（DSA/CSA 的行路径无 split，天然逐位稳定）。
 
 CMake 选项：`CPU_OPS_ENABLE_NATIVE`（默认 ON，`-march=native`）、
-`CPU_OPS_BUILD_EXAMPLES`、`CPU_OPS_BUILD_TESTS`。
+`CPU_OPS_BUILD_EXAMPLES`、`CPU_OPS_BUILD_TESTS`、`CPU_OPS_ISA_COMPILE_CHECK`
+（默认 OFF；为 sapphirerapids / icelake-server 额外生成 OBJECT 编译目标，把
+AVX512-BF16 / AMX 等非本机 ISA 的 kernel 纳入编译检查，不执行）。
+
+作为依赖集成：`cmake --install build` 之后可 `find_package(cpu_ops)` 并链接
+`cpu_ops::cpu_ops`（INTERFACE 目标，携带 include 路径与 Threads 依赖），或直接 vendor
+`include/` 目录。头文件库意味着 kernel 在**你的**编译单元内实例化：请自带 ISA 编译选项
+（如 `-O3 -march=native`）；无任何 SIMD 宏命中时自动走通用标量回退，功能正确但性能保底。
 
 ## 用法
 
@@ -94,7 +104,7 @@ gemm(args, 1);              // 强制单线程
 受 k 深度和 4 MiB 工作区预算约束）；1 = 禁止；>1 = 强制片数。split-k 的两阶段归约
 按固定顺序累加部分和，结果与单线程**逐位一致**。
 
-### int8 量化 GEMM（VNNI）
+### int8 量化 GEMM（VNNI / AMX）
 
 ```cpp
 using GemmI8 = cpu_ops::gemm::device::GemmU8S8S32<
@@ -105,6 +115,11 @@ GemmI8::Arguments args{{M, N, K}, {A_u8, lda}, {B_s8, ldb}, {C_s32, ldc}, {D_s32
 GemmI8 gemm;
 gemm(args);
 ```
+
+默认 policy 是 VNNI（x86）/ dotprod/i8mm（ARM）点积，任意平台有标量回退。
+另有实验性 AMX-INT8 瓦片 policy（`-march=sapphirerapids` 编译、Linux 运行时
+授权 tile；不满足时自动退回正确但慢的标量路径），opt-in 用法见
+`gemm/threadblock/mma_policy_amx.h` 头注释。
 
 ### f16 / bf16 输入（f32 累加 / 输出）
 
@@ -117,8 +132,13 @@ GemmF16::Arguments args{{M, N, K}, {A_f16, lda}, {B_f16, ldb}, {C, ldc}, {D, ldd
                         {alpha, beta}};
 ```
 
-`float16_t` / `bfloat16_t` 见 `element_types.h`：从 float 构造做 RNE 舍入，隐式转回
-float。`GemmBF16F32` 用法相同。八种 layout 组合均已实例化。
+`float16_t` / `bfloat16_t` 见 `numeric_types.h`：从 float 构造做 RNE 舍入，隐式转回
+float。`GemmBF16F32` 用法相同。八种 layout 组合均可直接实例化使用。
+
+用 AVX512-BF16 编译（`-march=sapphirerapids` 等）时 `GemmBF16F32` 自动切换到原生
+点积 policy（`vdpbf16ps`，打包流量减半、算力约为 f32 的 2×）；数值与 widen 路径不
+逐位一致（bf16 乘积少一次舍入，反而更准）。显式传 `mma::WidenPolicy<bfloat16_t>` +
+`GemmConfig<float>` 可强制旧的 widen 路径。
 
 ### MX 格式（mxfp8 / mxfp4 + E8M0 块缩放）
 
@@ -140,10 +160,10 @@ gemm(args);
 - 编码器：`float16_t` 式 RNE 饱和编码（`fp8e4m3_t::from_float` 等），scale 用
   `e8m0_from_float`（舍入到最近的 2 的幂）。
 - A/B 类型可以不同（如 e4m3×e5m2），C/D 固定 f32。
-- 解码在打包循环内做（AVX2 下 e4m3 用 F16C 位技巧、e2m1 用 PSHUFB 查表），
-  标量回退走 constexpr 查找表。
-- 同格式组合 × Row/Col C 已实例化于 `src/gemm_mx.cc`；交叉格式请包含
-  `cpu_ops/detail/gemm_device_defn.h` 自行实例化。
+- 解码在打包循环内做（AVX2 下 e4m3 用 F16C 位技巧、e2m1 用 PSHUFB 查表；
+  AVX512F 下同一套技巧 16 路宽，经 `_mm512_cvtph_ps` 转换），标量回退走
+  constexpr 查找表。所有 SIMD 解码与标量**逐位一致**。
+- 同格式与交叉格式组合都在调用处按需实例化（header-only），无预编译对象。
 
 ### 激活 / 归一化 / TopK（ops 层）
 
@@ -189,8 +209,8 @@ gemm(args);   // D = relu(alpha·A·B + beta·C + bias[col])，op 在输出瓦�
 
 内置 op：`Relu`、`Gelu`（tanh 近似）、`Silu`、`Clamp<T>`、`BiasAdd<T>`（按列）、
 `ScalePerRow<T>`、`ScalePerCol<T>`；`Chain<Ops...>` 顺序组合。op 契约是位置感知的
-`(x, row, col)` + `apply_vec` 车道形式，可自由扩展。融合 epilogue 不在静态库中
-预实例化——包含 `gemm_fused.h` 即在自己的编译单元内联整个 kernel。
+`(x, row, col)` + `apply_vec` 车道形式，可自由扩展。包含
+`gemm_fused.h` 即在自己的编译单元内实例化整个融合 kernel。
 
 ### Attention / MLA / DSA / CSA / KDA（组装示例）
 
@@ -212,13 +232,13 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 
 ### 通用说明
 
-- f32/f64 与 int8 各自的 A/B/C 八种 RowMajor/ColumnMajor 组合均已实例化。
+- f32/f64 与 int8 各自的 A/B/C 八种 RowMajor/ColumnMajor 组合均可直接实例化。
 - C 与 D 可指向同一缓冲区（原地 `C = alpha·A·B + beta·C`）。
 - 线程数只改变任务划分，不改变每个输出元素的运算顺序：单线程与多线程结果
   **逐位一致**（int8 是精确整数；f32/f64/f16/bf16/MX 的浮点求和顺序固定——split-k
   的部分和也按 slice 顺序归约）。
-- 自定义 tile 配置 / epilogue / mma policy：包含 `cpu_ops/detail/gemm_device_defn.h`
-  并显式实例化自己的 `Gemm<...>` 特化。
+- 自定义 tile 配置 / epilogue / mma policy：`gemm/device/gemm.h` 自带完整定义，
+  直接在自己的编译单元实例化 `Gemm<...>` 特化即可。
 
 ## 数据类型
 
@@ -226,8 +246,8 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 |---|---|---|
 | `Gemm<float, ...>` | f32×f32 → f32 | f32 FMA |
 | `Gemm<double, ...>` | f64×f64 → f64 | f64 FMA |
-| `GemmU8S8S32` | u8×s8 → s32 | VNNI `vpdpbusd`（4 路字节点积） |
-| `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32，走 f32 FMA |
+| `GemmU8S8S32` | u8×s8 → s32 | VNNI `vpdpbusd`（4 路字节点积）；ARM dotprod/i8mm；AMX-INT8 policy 可选（实验性） |
+| `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32 走 FMA；bf16 在 AVX512-BF16 上默认走 `vdpbf16ps` 原生点积 |
 | `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA |
 | `attention::Attention<T>`（示例） | f32/f16/bf16 → 同型 | QKᵀ + online softmax + PV 融合，f32 累加 |
 | `attention::MlaAttention<T>`（示例） | 共享 latent cache → 每 head 输出 | 吸收式：2×GEMM + fused 核心（dim_v ≠ dim） |
@@ -239,7 +259,9 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `ops::topk_indices` | f32 → int32[k] | MSD radix-select，与 partial_sort 逐位同语义 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
-乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同。
+乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同（例外：AVX512-BF16 目标上
+bf16 默认改用 `vdpbf16ps`，每条指令完成 32 次乘加，峰值约为 f32 的 2×——本机无
+该指令集，未实测）。
 
 ## 性能
 
@@ -341,6 +363,8 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
 - GEMV 无专用 kernel，单线程 GEMV 约为 OpenBLAS 的 0.5x。
 - 单线程 kernel 相对 OpenBLAS 有 0.82–0.92x 的差距，来自微内核调优深度。
 - ARM 路径（NEON / SVE2 / SME）尚未在大规模部署中验证，SME 为实验性。
+- AVX512-BF16 / AVX512F-MX 解码 / AMX-INT8 路径在本机（无对应指令集）仅经编译
+  检查与算法级等效验证（AVX2/标量复刻、qemu ARM 探针），未在真机运行。
 - 稠密 attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低
   （MLA 下尤甚）。稀疏行核的窄存→f32 已有向量宽化原语（`simd::widen_f16/
   widen_bf16`，NEON `vcvt`/`vshll`、AVX2 F16C/移位）+ indexer 按 8 头分块
@@ -363,12 +387,12 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
 
 | 层 | 组件 | 职责 |
 |---|---|---|
-| 指令层 | `simd::Vec<T, N>` | SIMD 寄存器抽象：`load / store / set1 / fmadd / dpbusd` |
-| 微内核层 | `MmaAtom` / `MmaAtomVnni` / `MmaAtomSmeF32` | MR×NR 累加瓦片驻留寄存器（或 SME ZA 瓦片） |
-| 策略层 | `mma::FmaPolicy` / `VnniPolicy` / `WidenPolicy` / `MxPolicy` / `SmePolicyF32` | 定义 ElemA/ElemB/PackedA/PackedB/AccT、k 步长、打包布局、微内核类型——`BlockGemm` 由 policy 驱动，扩展新指令集或新数据类型只需新增 policy |
-| 打包层 | `detail::pack_a / pack_b` | A/B 面板按微瓦片交织成连续内存，零填充处理边缘；Packed 类型 ≠ 输入类型时在打包处转换 |
-| 分块层 | `BlockGemm<Policy, ...>` | MC/NC/KC 三级 cache 分块主循环；B 条带驻留 L1，A 面板流式复用 |
-| 线程层 | `ThreadPool` + `partition_gemm` | 持久线程池；输出按 MR/NR 对齐的矩形区域静态划分（先切 N，不足再切 M），k 方向可再切 split-k 片 |
+| 指令层 | `simd::Vec<T, N>` | SIMD 寄存器抽象：`load / store / set1 / fmadd / dpbusd / dpbf16ps` |
+| 微内核层 | `MmaAtom` / `MmaAtomVnni` / `MmaAtomBf16` / `MmaAtomSmeF32` / `MmaAtomAmxInt8` | MR×NR 累加瓦片驻留寄存器（或 SME ZA / AMX 瓦片） |
+| 策略层 | `mma::FmaPolicy` / `VnniPolicy` / `WidenPolicy` / `MxPolicy` / `Bf16Policy` / `SmePolicyF32` / `AmxPolicy` | 定义 ElemA/ElemB/PackedA/PackedB/AccT、k 步长、打包布局、微内核类型——`BlockGemm` 由 policy 驱动，扩展新指令集或新数据类型只需新增 policy |
+| 打包层 | `gemm::threadblock::pack_a / pack_b` | A/B 面板按微瓦片交织成连续内存，零填充处理边缘；Packed 类型 ≠ 输入类型时在打包处转换 |
+| 分块层 | `gemm::threadblock::BlockGemm<Policy, ...>` | MC/NC/KC 三级 cache 分块主循环；B 条带驻留 L1，A 面板流式复用 |
+| 线程层 | `thread::ThreadPool` + `gemm::threadblock::partition_gemm` | 持久线程池；输出按 MR/NR 对齐的矩形区域静态划分（先切 N，不足再切 M），k 方向可再切 split-k 片 |
 | 入口层 | `gemm::device::Gemm` / `GemmMx` | 类模板入口：`Arguments` + `operator()` |
 | Epilogue | `epilogue::LinearCombination` / `LinearCombinationFused` | 写回时融合 `D = alpha·acc + beta·C` 及 op 链；split-k 时用 `PartialSum` 暂存部分和 |
 
@@ -377,19 +401,26 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
 
 ## ISA 支持
 
-同一套源码编译期分派（`include/cpu_ops/detail/simd.h` 检测，无运行时分派）：
+同一套源码编译期分派（`include/cpu_ops/arch/simd.h` 检测，无运行时分派）：
 
 | 平台 | 数据类型 | 指令 |
 |---|---|---|
 | x86-64 AVX2+FMA | f32 / f64 / f16 / bf16 / mxfp8 / mxfp4 | `vfmadd`（f16 转换用 F16C；MX 解码用 F16C+PSHUFB 快路径） |
 | x86 AVX-VNNI / AVX512-VNNI | u8×s8→s32 | `vpdpbusd` |
+| x86 AVX512-BF16 | bf16→f32 | `vdpbf16ps`（`GemmBF16F32` 默认；编译验证，本机无硬件未运行） |
+| x86 AVX512F | mxfp8 / mxfp4 解码 | `_mm512_cvtph_ps` 16 路宽（算法经 AVX2 复刻逐位验证；真机未运行） |
+| x86 AMX-INT8（实验性，opt-in） | u8×s8→s32 | `tdpbusd` 16×16 瓦片（编译验证 + 打包布局经标量回退精确验证；真机未运行） |
 | ARM NEON | f32 | `vfmaq_f32` |
+| ARM dotprod / i8mm | u8×s8→s32 | `vdotq_u32`（偏置技巧）/ `vusdotq_s32`（qemu 探针逐位验证） |
 | ARM SVE/SVE2 定长（`-msve-vector-bits=N`） | f32 / f64 | `svmla` |
 | ARM SME（实验性） | f32 | `svfmopa`（外积累加进 ZA 瓦片） |
 | 任意平台 | 全部 | 通用标量回退（`CPU_OPS_FORCE_SCALAR` 可强制） |
 
-int8 路径选择 `vpdpbusd`（VNNI）而非 AMX：AMX 只支持 int8/bf16/fp16/fp8、不支持
-f32/f64，且仅存在于部分至强；VNNI 在消费级 CPU 上普遍具备。
+int8 默认路径选择 `vpdpbusd`（VNNI）而非 AMX：AMX 只支持 int8/bf16/fp16/fp8、不支持
+f32/f64，且仅存在于部分至强；VNNI 在消费级 CPU 上普遍具备。AMX-INT8 以实验性
+opt-in policy 提供（`mma_policy_amx.h`）：需要 `-mamx-tile -mamx-int8` 编译与 Linux
+`arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)` 运行时授权（首次使用自动
+申请）；不满足时 atom 退回标量路径，结果保持精确。
 
 ARM 构建（需要 aarch64 工具链，GCC 14+ / Clang 18+）：
 
@@ -398,8 +429,16 @@ ARM 构建（需要 aarch64 工具链，GCC 14+ / Clang 18+）：
 aarch64-linux-gnu-g++ -O3 ...
 # SVE2 定长（如 256-bit）
 aarch64-linux-gnu-g++ -O3 -march=armv9-a+sve2 -msve-vector-bits=256 ...
-# SME（实验性）
-aarch64-linux-gnu-g++ -O3 -march=armv9.2-a+sme -msve-vector-bits=512 src/gemm_sme_f32.cc ...
+# SME（实验性；kernel 在你的编译单元内实例化）
+aarch64-linux-gnu-g++ -O3 -march=armv9.2-a+sme -msve-vector-bits=512 your_kernel.cc ...
+# int8 dotprod / i8mm（默认 VnniPolicy 自动启用）
+aarch64-linux-gnu-g++ -O3 -march=armv8.2-a+dotprod ...   # 或 armv8.6-a（含 i8mm）
+```
+
+x86 ISA 编译检查（本机无 AVX-512/AMX 时保持这些头文件编译干净）：
+
+```bash
+cmake -B build -DCPU_OPS_ISA_COMPILE_CHECK=ON && cmake --build build -j
 ```
 
 ## 目录结构
@@ -407,47 +446,46 @@ aarch64-linux-gnu-g++ -O3 -march=armv9.2-a+sme -msve-vector-bits=512 src/gemm_sm
 ```
 include/cpu_ops/
 ├── cpu_ops.h                        # 伞头文件
-├── matrix_shape.h                   # Shape / GemmCoord
-├── layout.h                         # RowMajor / ColumnMajor / TensorRef
-├── element_types.h                  # float16_t / bfloat16_t
-├── mx_formats.h                     # fp8e4m3_t / fp8e5m2_t / fp4e2m1_t / E8M0 / MxTensorRef
-├── ops/                             # 算子原语层（实例化于 src/ops.cc）
-│   ├── activation.h                 # gelu/silu（f32 车道 + 向量窄存）
-│   ├── norm.h                       # rmsnorm / fused add+rmsnorm / layernorm
-│   ├── topk.h                       # MSD radix-select 精确 top-k
-│   └── detail/parallel.h            # p×8 连续大块的任务切分
 ├── status.h                         # Status 枚举
+├── numeric_types.h                  # float16_t / bfloat16_t
+├── mx_formats.h                     # fp8e4m3_t / fp8e5m2_t / fp4e2m1_t / E8M0 / MxTensorRef
+├── matrix_shape.h                   # Shape（静态 M/N/K）
+├── gemm_coord.h                     # GemmCoord（运行时 problem size）
+├── tensor_ref.h                     # TensorRef（非拥有 2D 视图 + leading dimension）
+├── layout/
+│   └── matrix.h                     # RowMajor / ColumnMajor
+├── arch/                            # ISA 级原语
+│   ├── simd.h                       # ISA 检测 + simd::Vec（AVX2/VNNI/AVX512/SVE/NEON/标量）
+│   └── mma_atom.h                   # FMA 寄存器微内核
+├── gemm/
+│   ├── device/                      # device 级算子（完整定义，包含即用）
+│   │   ├── gemm.h                   # device::Gemm、GemmConfig、U8S8S32/F16/BF16 别名
+│   │   ├── gemm_fused.h             # GemmFusedF32/F64 融合 epilogue 别名
+│   │   └── gemm_mx.h                # device::GemmMx、E4M3/E5M2/E2M1 别名
+│   ├── kernel/
+│   │   └── run_blocked.h            # 线程划分 + split-k 两阶段编排（Gemm/GemmMx 共享）
+│   └── threadblock/                 # 线程块级：policy、打包、主循环、区域划分
+│       ├── block_gemm.h             # policy 驱动的 cache 分块主循环 + 宏内核
+│       ├── mma_policy_fma.h         # f32/f64 policy
+│       ├── mma_policy_vnni.h        # int8 点积 policy + 微内核 + 打包
+│       ├── mma_policy_widen.h       # f16/bf16 → f32 打包转换 policy
+│       ├── mma_policy_mx.h          # MX 格式解码 policy（AVX2 / AVX512F SIMD 解码快路径）
+│       ├── mma_policy_bf16.h        # AVX512-BF16 原生点积 policy（vdpbf16ps）+ 打包
+│       ├── mma_policy_amx.h         # AMX-INT8 瓦片 policy（实验性，opt-in，含标量回退）
+│       ├── mma_policy_sme.h         # ARM SME FMOPA policy（实验性）
+│       ├── pack.h                   # A/B 面板打包（零填充，DstT 独立于输入类型）
+│       └── threadblock_swizzle.h    # 输出区域划分（含 k 方向 split-k 切片）
 ├── epilogue/
 │   ├── linear_combination.h         # LinearCombination (alpha/beta/ReLU)
 │   ├── fusion.h                     # 融合 op 链：Relu/Clamp/BiasAdd/ScalePerRow/ScalePerCol/Chain
 │   └── partial_sum.h                # split-k 第一阶段的部分和 epilogue
-├── gemm/device/
-│   ├── gemm.h                       # device::Gemm 声明、GemmConfig、U8S8S32/F16/BF16 别名
-│   ├── gemm_fused.h                 # GemmFusedF32/F64（头文件实例化路径）
-│   └── gemm_mx.h                    # device::GemmMx 声明、E4M3/E5M2/E2M1 别名
-└── detail/                          # 内部实现（模板机制）
-    ├── simd.h                       # ISA 检测 + simd::Vec（AVX2/VNNI/SVE/NEON/标量）
-    ├── mma_atom.h                   # FMA 寄存器微内核
-    ├── mma_policy_fma.h             # f32/f64 policy
-    ├── mma_policy_vnni.h            # int8 点积 policy + 微内核 + 打包
-    ├── mma_policy_widen.h           # f16/bf16 → f32 打包转换 policy
-    ├── mma_policy_mx.h              # MX 格式解码 policy（含 AVX2 SIMD 解码快路径）
-    ├── mma_policy_sme.h             # ARM SME FMOPA policy（实验性）
-    ├── pack.h                       # A/B 面板打包（零填充，DstT 独立于输入类型）
-    ├── block_gemm.h                 # policy 驱动的 cache 分块主循环 + 宏内核
-    ├── thread_pool.h                # 持久线程池
-    ├── thread_swizzle.h             # 输出区域划分（含 k 方向 split-k 切片）
-    └── gemm_device_defn.h           # Gemm/GemmMx 共享编排：分区、split-k、归约
-src/
-├── thread_pool.cc
-├── thread_swizzle.cc
-├── gemm_f32.cc                      # float × 8 种 layout 组合显式实例化
-├── gemm_f64.cc                      # double × 8
-├── gemm_vnni.cc                     # u8×s8→s32 × 8
-├── gemm_f16.cc / gemm_bf16.cc       # f16/bf16 → f32 × 8
-├── gemm_mx.cc                       # MX 同格式组合 × Row/Col C
-├── ops.cc                           # activation/norm × f32/f16/bf16 显式实例化
-└── gemm_sme_f32.cc                  # SME f32 × 8（非 SME 编译时为空）
+├── ops/                             # 算子原语层
+│   ├── activation.h                 # gelu/silu（f32 车道 + 向量窄存）
+│   ├── norm.h                       # rmsnorm / fused add+rmsnorm / layernorm
+│   ├── topk.h                       # MSD radix-select 精确 top-k
+│   └── detail/parallel.h            # p×8 连续大块的任务切分
+└── thread/
+    └── thread_pool.h                # 持久线程池（inline 实现）
 examples/
 ├── 00_basic_gemm.cc                 # 最小 GEMM 示例
 ├── 01_benchmark.cc                  # GEMM 基准

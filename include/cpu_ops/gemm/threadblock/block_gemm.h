@@ -2,10 +2,12 @@
 
 #include <type_traits>
 
-#include "cpu_ops/layout.h"
+#include "cpu_ops/layout/matrix.h"
+#include "cpu_ops/tensor_ref.h"
 
 namespace cpu_ops {
 namespace gemm {
+namespace threadblock {
 
 // Detects epilogues offering a lane-wise form
 // E::apply_vec(Vec, Vec, bool, bool, int, int) (see epilogue/linear_combination.h).
@@ -44,7 +46,7 @@ struct can_vector_store<A, E, L, std::void_t<typename A::VecT>>
 
 // Cache-blocked GEMM mainloop over a rectangular C region [m0, m1) x [n0, n1)
 // reducing the k range [k0, k1), parameterized by an MmaPolicy (see
-// detail/mma_policy_fma.h):
+// mma_policy_fma.h):
 //
 //   for jc over NC:                    // L2-level column block
 //     for pc over K step KC:           // L2-level k block
@@ -175,5 +177,6 @@ struct BlockGemm {
   }
 };
 
+}  // namespace threadblock
 }  // namespace gemm
 }  // namespace cpu_ops

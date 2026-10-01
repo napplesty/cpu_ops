@@ -1,12 +1,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <vector>
 
-#include "cpu_ops/detail/simd.h"
-#include "cpu_ops/element_types.h"
+#include "cpu_ops/arch/simd.h"
+#include "cpu_ops/numeric_types.h"
 
 namespace {
 
@@ -73,6 +74,59 @@ void test_dpbusd(const char* name) {
     if (out[l] != want) {
       ++g_failures;
       std::printf("FAIL [%s] dpbusd lane %d: got %d want %d\n", name, l, out[l], want);
+    }
+  }
+}
+
+// 2-way bf16 dot product accumulated per f32 lane; each lane's 32 bits pack
+// two bf16 k-slices (low half = the even k).
+template <int N>
+void test_dpbf16ps(const char* name) {
+  std::mt19937 rng(static_cast<unsigned>(N * 47));
+  std::uniform_real_distribution<float> dist(-4.f, 4.f);
+  const auto trunc16 = [](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u >> 16;
+  };
+  const auto from_bits = [](uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+
+  std::vector<uint32_t> aw(N), bw(N);
+  std::vector<float> acc(N), out(N, 0.f);
+  std::vector<float> a0(N), a1(N), b0(N), b1(N);
+  for (int l = 0; l < N; ++l) {
+    const uint32_t ha0 = trunc16(dist(rng)), ha1 = trunc16(dist(rng));
+    const uint32_t hb0 = trunc16(dist(rng)), hb1 = trunc16(dist(rng));
+    aw[l] = ha0 | (ha1 << 16);
+    bw[l] = hb0 | (hb1 << 16);
+    a0[l] = from_bits(ha0 << 16);
+    a1[l] = from_bits(ha1 << 16);
+    b0[l] = from_bits(hb0 << 16);
+    b1[l] = from_bits(hb1 << 16);
+    acc[l] = dist(rng);
+  }
+
+  using V = cpu_ops::simd::Vec<float, N>;
+  const V r = cpu_ops::simd::dpbf16ps(
+      V::load(acc.data()), V::load(reinterpret_cast<const float*>(aw.data())),
+      V::load(reinterpret_cast<const float*>(bw.data())));
+  r.store(out.data());
+  for (int l = 0; l < N; ++l) {
+    // Scalar reference: two fused steps, (acc + a0*b0) + a1*b1. A hardware
+    // vdpbf16ps rounds the whole sum once instead, so allow a few ulp.
+    const float want = std::fma(a1[l], b1[l], std::fma(a0[l], b0[l], acc[l]));
+    const float tol = 8.f * std::numeric_limits<float>::epsilon() *
+                          (std::fabs(a0[l] * b0[l]) + std::fabs(a1[l] * b1[l]) +
+                           std::fabs(acc[l])) +
+                      1e-30f;
+    if (!(std::fabs(out[l] - want) <= tol)) {
+      ++g_failures;
+      std::printf("FAIL [%s] dpbf16ps lane %d: got %g want %g\n", name, l, out[l],
+                  want);
     }
   }
 }
@@ -144,6 +198,14 @@ int main() {
 
   test_dpbusd<cpu_ops::simd::native_width<int32_t>()>("native int32");
   test_dpbusd<3>("generic int32<3>");
+
+  test_dpbf16ps<cpu_ops::simd::native_width<float>()>("native float");
+  test_dpbf16ps<3>("generic float<3>");
+#if !defined(CPU_OPS_SIMD_SVE) || (__ARM_FEATURE_SVE_BITS != 512)
+  // On SVE-512 Vec<float,16> is the (array-less) SVE specialization, which
+  // has no dpbf16ps overload; everywhere else width 16 is generic or covered.
+  test_dpbf16ps<16>("float<16>");
+#endif
 
   test_widen();
 

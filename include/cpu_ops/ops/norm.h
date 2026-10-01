@@ -26,9 +26,9 @@
 #include <new>
 #include <type_traits>
 
-#include "cpu_ops/detail/simd.h"
-#include "cpu_ops/detail/thread_pool.h"
-#include "cpu_ops/element_types.h"
+#include "cpu_ops/arch/simd.h"
+#include "cpu_ops/thread/thread_pool.h"
+#include "cpu_ops/numeric_types.h"
 #include "cpu_ops/ops/detail/parallel.h"
 #include "cpu_ops/status.h"
 
@@ -161,7 +161,6 @@ inline void center_scale_row(const T* x, const T* w, T* y, int n, float b,
 template <typename T>
 inline void add_row_f32(const T* x, const T* r, float* dst, int n) {
   constexpr int W = simd::native_width<float>();
-  using FV = simd::Vec<float, W>;
   int i = 0;
   for (; i + W <= n; i += W) {
     simd::add(widen4(x + i), widen4(r + i)).store(dst + i);

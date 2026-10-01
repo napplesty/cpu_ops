@@ -22,10 +22,11 @@
 #include <algorithm>
 #include <cmath>
 
-#include "cpu_ops/detail/mma_atom.h"
-#include "cpu_ops/detail/pack.h"
-#include "cpu_ops/detail/simd.h"
-#include "cpu_ops/layout.h"
+#include "cpu_ops/arch/mma_atom.h"
+#include "cpu_ops/gemm/threadblock/pack.h"
+#include "cpu_ops/arch/simd.h"
+#include "cpu_ops/layout/matrix.h"
+#include "cpu_ops/tensor_ref.h"
 
 namespace cpu_ops {
 namespace attention {
@@ -169,7 +170,7 @@ struct AttentionBlockKernel {
       // --- O += P · V over the value extent ---
       // P is already f32 in the S buffer; pack directly (bypasses the policy,
       // which is typed for the storage element).
-      cpu_ops::detail::pack_a(TensorRef<const float, layout::RowMajor>(sp, kKVBlock), 0, 0,
+      cpu_ops::gemm::threadblock::pack_a(TensorRef<const float, layout::RowMajor>(sp, kKVBlock), 0, 0,
                               rows, nb, kAttnMR, ppk);
       Policy::pack_b(TensorRef<const T, layout::RowMajor>(v_head, v_ld), c0, 0, nb, nb,
                      dv, kAttnNR, bpk);

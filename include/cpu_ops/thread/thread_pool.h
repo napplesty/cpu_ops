@@ -1,7 +1,8 @@
-#include "cpu_ops/detail/thread_pool.h"
+#pragma once
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -9,7 +10,9 @@
 namespace cpu_ops {
 namespace thread {
 
-struct ThreadPool::Impl {
+namespace detail {
+
+struct ThreadPoolImpl {
   std::vector<std::thread> workers;
   std::mutex mutex;           // guards fn / n_tasks / generation / stop
   std::condition_variable cv;
@@ -21,7 +24,7 @@ struct ThreadPool::Impl {
   bool stop = false;
   std::mutex invoke_mutex;  // serializes parallel_for calls
 
-  Impl() {
+  ThreadPoolImpl() {
     const unsigned hw = std::thread::hardware_concurrency();
     const int n_workers = hw > 1 ? static_cast<int>(hw) - 1 : 0;
     workers.reserve(n_workers);
@@ -30,7 +33,7 @@ struct ThreadPool::Impl {
     }
   }
 
-  ~Impl() {
+  ~ThreadPoolImpl() {
     {
       std::lock_guard<std::mutex> lk(mutex);
       stop = true;
@@ -85,20 +88,40 @@ struct ThreadPool::Impl {
   }
 };
 
-ThreadPool& ThreadPool::global() {
-  static ThreadPool pool;
-  return pool;
-}
+}  // namespace detail
 
-ThreadPool::ThreadPool() : impl_(new Impl()) {}
+// Persistent thread pool. The global instance sizes itself to
+// std::thread::hardware_concurrency(); worker threads are created lazily on
+// first use and joined at process exit.
+//
+// parallel_for is not re-entrant and not safe to call concurrently from
+// multiple user threads; callers get serialized through an internal mutex.
+class ThreadPool {
+ public:
+  static ThreadPool& global() {
+    static ThreadPool pool;
+    return pool;
+  }
 
-ThreadPool::~ThreadPool() { delete impl_; }
+  // Total number of execution slots: worker threads + the calling thread.
+  int num_threads() const { return static_cast<int>(impl_->workers.size()) + 1; }
 
-int ThreadPool::num_threads() const { return static_cast<int>(impl_->workers.size()) + 1; }
+  // Runs fn(task, thread_index) for every task in [0, n_tasks), potentially in
+  // parallel, and blocks until all of them have completed. thread_index 0 is
+  // the calling thread.
+  void parallel_for(int n_tasks, const std::function<void(int, int)>& fn) {
+    impl_->parallel_for(n_tasks, fn);
+  }
 
-void ThreadPool::parallel_for(int n_tasks, const std::function<void(int, int)>& fn) {
-  impl_->parallel_for(n_tasks, fn);
-}
+  ThreadPool(const ThreadPool&) = delete;
+  ThreadPool& operator=(const ThreadPool&) = delete;
+
+ private:
+  ThreadPool() : impl_(new detail::ThreadPoolImpl()) {}
+  ~ThreadPool() { delete impl_; }
+
+  detail::ThreadPoolImpl* impl_;
+};
 
 }  // namespace thread
 }  // namespace cpu_ops

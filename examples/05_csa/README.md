@@ -2,7 +2,7 @@
 
 DeepSeek Native Sparse Attention（arXiv 2502.11089）的三分支设计，组装在
 MLA 潜空间缓存之上。`csa.h` 复用 `04_dsa` 的流式行核原语
-（`dot_f32` / `axpy_f32`），不链接进 `libcpu_ops.a`。
+（`dot_f32` / `axpy_f32`），不进入核心库。
 
 **算法**（每个 query 三路并行、sigmoid 门控加权求和）：
 

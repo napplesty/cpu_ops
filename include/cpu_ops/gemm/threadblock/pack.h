@@ -1,9 +1,10 @@
 #pragma once
 
-#include "cpu_ops/layout.h"
+#include "cpu_ops/tensor_ref.h"
 
 namespace cpu_ops {
-namespace detail {
+namespace gemm {
+namespace threadblock {
 
 // Packs the kc x nc panel of B whose top-left corner is (k0, j0) into the
 // strip-interleaved layout consumed by MmaAtom:
@@ -52,5 +53,6 @@ void pack_a(const TensorRef<const T, LayoutA>& a, int i0, int k0, int mc, int kc
   }
 }
 
-}  // namespace detail
+}  // namespace threadblock
+}  // namespace gemm
 }  // namespace cpu_ops
