@@ -150,17 +150,6 @@ void check_thread_determinism(int m, int n, int k) {
 
 }  // namespace
 
-// Tile shape of the 512-bit VNNI path (VLEN = 16): what the default policy
-// selection uses on AVX512-VNNI hosts, exercised on every host through the
-// portable Vec<int32_t, 16> fallback.
-struct Vnni512Config {
-  static constexpr int kMR = 6;
-  static constexpr int kNR = 32;
-  static constexpr int kMC = 126;  // multiple of kMR
-  static constexpr int kNC = 256;  // multiple of kNR
-  static constexpr int kKC = 256;
-};
-
 int main() {
   struct ShapeCfg {
     int m, n, k;
@@ -214,22 +203,24 @@ int main() {
                                                                      true, 8);
   }
 
-  // The 512-bit VNNI tile shape (see Vnni512Config above).
+  // The 512-bit VNNI tile shape: the default config on AVX512-VNNI hosts,
+  // exercised on every host through the portable Vec<int32_t, 16> fallback.
   {
     using cpu_ops::layout::ColumnMajor;
     using cpu_ops::layout::RowMajor;
+    using cpu_ops::mma::Vnni512GemmConfig;
     using Vnni512 = cpu_ops::mma::VnniPolicy<16>;
     for (const ShapeCfg& s : shapes) {
       for (int threads : {1, 8}) {
-        run_case<RowMajor, RowMajor, RowMajor, Vnni512Config, Vnni512>(s.m, s.n, s.k, 1, 0,
+        run_case<RowMajor, RowMajor, RowMajor, Vnni512GemmConfig, Vnni512>(s.m, s.n, s.k, 1, 0,
                                                                        false, threads);
-        run_case<ColumnMajor, ColumnMajor, ColumnMajor, Vnni512Config, Vnni512>(
+        run_case<ColumnMajor, ColumnMajor, ColumnMajor, Vnni512GemmConfig, Vnni512>(
             s.m, s.n, s.k, 3, -2, false, threads);
       }
     }
-    run_case<RowMajor, RowMajor, RowMajor, Vnni512Config, Vnni512>(16, 24, 0, 1, 5, false,
+    run_case<RowMajor, RowMajor, RowMajor, Vnni512GemmConfig, Vnni512>(16, 24, 0, 1, 5, false,
                                                                    4);
-    run_case<RowMajor, RowMajor, RowMajor, Vnni512Config, Vnni512>(32, 32, 8192, 1, 1,
+    run_case<RowMajor, RowMajor, RowMajor, Vnni512GemmConfig, Vnni512>(32, 32, 8192, 1, 1,
                                                                    true, 8);
   }
 

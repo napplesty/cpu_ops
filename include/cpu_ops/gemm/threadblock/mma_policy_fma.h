@@ -83,14 +83,14 @@ struct Fma512Policy {
 };
 
 // Tile config for Fma512Policy: MR x NR = 8 x 32 keeps 16 of 32 ZMM as
-// accumulators; cache blocks mirror the f32 config (KC is unchanged so panel
-// footprints double only through NR).
+// accumulators. NC/KC = 512 measured best on Zen 4 (B panel = 1 MiB f32,
+// one L2); see the ISA notes in README.
 struct Fma512GemmConfig {
   static constexpr int kMR = 8;
   static constexpr int kNR = 32;  // 2 x 16 f32 lanes
   static constexpr int kMC = 128;  // multiple of kMR
-  static constexpr int kNC = 256;  // multiple of kNR
-  static constexpr int kKC = 256;
+  static constexpr int kNC = 512;  // multiple of kNR
+  static constexpr int kKC = 512;
 };
 
 }  // namespace mma

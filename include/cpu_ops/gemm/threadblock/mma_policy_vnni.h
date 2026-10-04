@@ -139,5 +139,16 @@ struct VnniPolicy {
   }
 };
 
+// Tile config for the 512-bit VNNI path (VLEN = 16): MR x NR = 8 x 32 with
+// 16 of 32 ZMM as accumulators. NC/KC tuned on Zen 4 (B panel = 512 KiB).
+// Used by GemmU8S8S32 only when CPU_OPS_SIMD_AVX512VNNI is set.
+struct Vnni512GemmConfig {
+  static constexpr int kMR = 8;
+  static constexpr int kNR = 32;
+  static constexpr int kMC = 128;   // multiple of kMR
+  static constexpr int kNC = 1024;  // multiple of kNR
+  static constexpr int kKC = 512;
+};
+
 }  // namespace mma
 }  // namespace cpu_ops

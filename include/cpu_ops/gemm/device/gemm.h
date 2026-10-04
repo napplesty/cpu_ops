@@ -143,11 +143,20 @@ class Gemm {
 
 // uint8 x int8 -> int32 quantized GEMM. Uses 4-way byte dot-product
 // accumulation (AVX-VNNI / AVX512-VNNI when available, portable scalar
-// fallback otherwise). alpha/beta are int32.
+// fallback otherwise). alpha/beta are int32. On AVX512-VNNI hosts the tile
+// widens to NR = 32 of 512-bit lanes with deeper cache blocks
+// (Vnni512GemmConfig, tuned on Zen 4).
+#if defined(CPU_OPS_SIMD_AVX512VNNI)
+template <typename LayoutA, typename LayoutB, typename LayoutC>
+using GemmU8S8S32 = Gemm<uint8_t, LayoutA, int8_t, LayoutB, int32_t, LayoutC, int32_t,
+                         epilogue::LinearCombination<int32_t>, mma::Vnni512GemmConfig,
+                         mma::VnniPolicy<>>;
+#else
 template <typename LayoutA, typename LayoutB, typename LayoutC>
 using GemmU8S8S32 = Gemm<uint8_t, LayoutA, int8_t, LayoutB, int32_t, LayoutC, int32_t,
                          epilogue::LinearCombination<int32_t>, GemmConfig<int32_t>,
                          mma::VnniPolicy<>>;
+#endif
 
 // Half-precision input GEMM with f32 accumulation and f32 output
 // (C/D, alpha/beta are float). A/B are widened to f32 at pack time, so the

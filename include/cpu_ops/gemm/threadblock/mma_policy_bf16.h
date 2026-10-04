@@ -147,14 +147,15 @@ struct Bf16Policy {
   }
 };
 
-// Tile config for the bf16 atom: NR = 2 x 16 f32 lanes (12 of 32 ZMM hold
-// accumulators at MR = 6); cache blocks mirror the f32 config.
+// Tile config for the bf16 atom: MR x NR = 8 x 32 f32 lanes (16 of 32 ZMM
+// hold accumulators). NC/KC tuned on Zen 4; the narrower operand (2 bytes)
+// lets the B panel stay resident in L2 at NC = 1024.
 struct Bf16GemmConfig {
-  static constexpr int kMR = 6;
+  static constexpr int kMR = 8;
   static constexpr int kNR = 32;
-  static constexpr int kMC = 126;  // multiple of kMR
-  static constexpr int kNC = 256;  // multiple of kNR
-  static constexpr int kKC = 256;
+  static constexpr int kMC = 128;   // multiple of kMR
+  static constexpr int kNC = 1024;  // multiple of kNR
+  static constexpr int kKC = 512;
 };
 
 }  // namespace mma
