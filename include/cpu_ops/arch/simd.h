@@ -14,6 +14,9 @@
 #endif
 #if defined(__AVX512F__)
 #define CPU_OPS_SIMD_AVX512F 1
+#if defined(__AVX512VNNI__)
+#define CPU_OPS_SIMD_AVX512VNNI 1
+#endif
 #if defined(__AVX512BF16__)
 #define CPU_OPS_SIMD_AVX512BF16 1
 #endif
@@ -31,6 +34,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 namespace cpu_ops {
 namespace simd {
@@ -584,6 +588,45 @@ inline Vec<float, 16> dpbf16ps(Vec<float, 16> acc, Vec<float, 16> a, Vec<float, 
 }
 #endif  // CPU_OPS_SIMD_AVX512BF16
 
+#if defined(CPU_OPS_SIMD_AVX512VNNI)
+// 512-bit int32 vector for the quantized GEMM path: one vpdpbusd covers
+// 16 lanes x 4 packed k-slices. Wired into native_width<int32_t>() below, so
+// the VNNI policy picks it up automatically.
+template <>
+struct Vec<int32_t, 16> {
+  __m512i v;
+  Vec() = default;
+  Vec(__m512i x) : v(x) {}  // implicit on purpose
+  static Vec load(const int32_t* p) {
+    return _mm512_loadu_si512(reinterpret_cast<const void*>(p));
+  }
+  static Vec set1(int32_t x) { return _mm512_set1_epi32(x); }
+  static Vec set1_u32(uint32_t x) { return _mm512_set1_epi32(static_cast<int32_t>(x)); }
+  void store(int32_t* p) const {
+    _mm512_storeu_si512(reinterpret_cast<void*>(p), v);
+  }
+};
+
+inline Vec<int32_t, 16> dpbusd(Vec<int32_t, 16> acc, Vec<int32_t, 16> a,
+                               Vec<int32_t, 16> b) {
+  acc.v = _mm512_dpbusd_epi32(acc.v, a.v, b.v);
+  return acc;
+}
+
+inline Vec<int32_t, 16> mul(const Vec<int32_t, 16>& a, const Vec<int32_t, 16>& b) {
+  return _mm512_mullo_epi32(a.v, b.v);
+}
+inline Vec<int32_t, 16> add(const Vec<int32_t, 16>& a, const Vec<int32_t, 16>& b) {
+  return _mm512_add_epi32(a.v, b.v);
+}
+inline Vec<int32_t, 16> max(const Vec<int32_t, 16>& a, const Vec<int32_t, 16>& b) {
+  return _mm512_max_epi32(a.v, b.v);
+}
+inline Vec<int32_t, 16> min(const Vec<int32_t, 16>& a, const Vec<int32_t, 16>& b) {
+  return _mm512_min_epi32(a.v, b.v);
+}
+#endif  // CPU_OPS_SIMD_AVX512VNNI
+
 #endif  // CPU_OPS_SIMD_AVX512F
 
 #if defined(CPU_OPS_SIMD_SVE)
@@ -824,10 +867,21 @@ inline Vec<int32_t, 4> dpbusd(Vec<int32_t, 4> acc, Vec<int32_t, 4> a, Vec<int32_
 #endif  // CPU_OPS_SIMD_NEON
 
 // Number of elements in the widest efficient native vector for T.
+// float/double stay at the AVX2 width on AVX-512 hosts (the f32/f64 mainloop
+// and the ops layer keep their tuned tile shapes; 512-bit f32 GEMM is opt-in
+// via mma::Fma512Policy), while int32 follows the widest byte dot-product
+// unit since only the VNNI GEMM path consumes it.
 template <typename T>
 constexpr int native_width() {
 #if defined(CPU_OPS_SIMD_AVX2)
-  return sizeof(T) == 4 ? 8 : 4;
+  if (sizeof(T) == 4) {
+#if defined(CPU_OPS_SIMD_AVX512VNNI)
+    return std::is_same<T, int32_t>::value ? 16 : 8;
+#else
+    return 8;
+#endif
+  }
+  return 4;
 #elif defined(CPU_OPS_SIMD_SVE)
   return sizeof(T) == 4 ? __ARM_FEATURE_SVE_BITS / 32 : __ARM_FEATURE_SVE_BITS / 64;
 #elif defined(CPU_OPS_SIMD_NEON)

@@ -198,6 +198,8 @@ int main() {
 
   test_dpbusd<cpu_ops::simd::native_width<int32_t>()>("native int32");
   test_dpbusd<3>("generic int32<3>");
+  // The AVX512-VNNI width: native zmm there, portable fallback elsewhere.
+  test_dpbusd<16>("int32<16>");
 
   test_dpbf16ps<cpu_ops::simd::native_width<float>()>("native float");
   test_dpbf16ps<3>("generic float<3>");

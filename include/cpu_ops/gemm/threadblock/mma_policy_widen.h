@@ -15,7 +15,7 @@
 namespace cpu_ops {
 namespace mma {
 
-template <typename StorageT>
+template <typename StorageT, int VLEN = simd::native_width<float>()>
 struct WidenPolicy {
   using ElemA = StorageT;
   using ElemB = StorageT;
@@ -27,7 +27,7 @@ struct WidenPolicy {
   static constexpr int pad_kc(int kc) { return kc; }
 
   template <int MR, int NR>
-  using Atom = MmaAtom<float, MR, NR>;
+  using Atom = MmaAtom<float, MR, NR, VLEN>;
 
   template <typename LayoutA>
   static void pack_a(TensorRef<const StorageT, LayoutA> a, int i0, int k0, int mc, int kc,

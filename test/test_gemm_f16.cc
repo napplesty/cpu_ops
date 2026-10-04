@@ -298,6 +298,25 @@ int main() {
     check_splitk<bfloat16_t, Bf16GemmConfig, Bf16Policy>(8);
   }
 
+  // The 512-bit widen path (GemmF16F32's compute width on AVX-512F hosts),
+  // pinned explicitly so it is covered on every host through the portable
+  // Vec<float, 16> fallback.
+  {
+    using cpu_ops::layout::ColumnMajor;
+    using cpu_ops::layout::RowMajor;
+    using cpu_ops::mma::Fma512GemmConfig;
+    using Widen512 = cpu_ops::mma::WidenPolicy<float16_t, 16>;
+    for (const ShapeCfg& s : shapes) {
+      for (int threads : {1, 8}) {
+        run_case<float16_t, RowMajor, RowMajor, RowMajor, Fma512GemmConfig, Widen512>(
+            s.m, s.n, s.k, 1.0f, 0.0f, threads);
+        run_case<float16_t, ColumnMajor, ColumnMajor, ColumnMajor, Fma512GemmConfig,
+                 Widen512>(s.m, s.n, s.k, 2.0f, -0.5f, threads);
+      }
+    }
+    check_splitk<float16_t, Fma512GemmConfig, Widen512>(8);
+  }
+
   std::printf("test_gemm_f16: %d cases, %d failures\n", g_cases, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

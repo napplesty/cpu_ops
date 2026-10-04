@@ -50,5 +50,48 @@ struct FmaPolicy {
   }
 };
 
+// f32 policy pinned to 512-bit vectors (VLEN = 16) regardless of
+// native_width<float>() — the float width stays at 8 for ISA-tuning reasons
+// (see simd.h), so this policy is how the mainloop exploits AVX-512F: twice
+// the lanes per FMA plus 32 architectural registers allow a deeper
+// accumulator tile. On non-AVX-512 hosts it still compiles and runs through
+// the portable Vec<float, 16> fallback, which is how the tests cover it.
+struct Fma512Policy {
+  using ElemA = float;
+  using ElemB = float;
+  using AccT = float;
+  using PackedA = float;
+  using PackedB = float;
+
+  static constexpr int kKStep = 1;
+  static constexpr int pad_kc(int kc) { return kc; }
+
+  template <int MR, int NR>
+  using Atom = MmaAtom<float, MR, NR, 16>;
+
+  template <typename LayoutA>
+  static void pack_a(TensorRef<const float, LayoutA> a, int i0, int k0, int mc, int kc,
+                     int /*kc_pad*/, int mr, float* dst) {
+    gemm::threadblock::pack_a(a, i0, k0, mc, kc, mr, dst);
+  }
+
+  template <typename LayoutB>
+  static void pack_b(TensorRef<const float, LayoutB> b, int k0, int j0, int kc,
+                     int /*kc_pad*/, int nc, int nr, float* dst) {
+    gemm::threadblock::pack_b(b, k0, j0, kc, nc, nr, dst);
+  }
+};
+
+// Tile config for Fma512Policy: MR x NR = 8 x 32 keeps 16 of 32 ZMM as
+// accumulators; cache blocks mirror the f32 config (KC is unchanged so panel
+// footprints double only through NR).
+struct Fma512GemmConfig {
+  static constexpr int kMR = 8;
+  static constexpr int kNR = 32;  // 2 x 16 f32 lanes
+  static constexpr int kMC = 128;  // multiple of kMR
+  static constexpr int kNC = 256;  // multiple of kNR
+  static constexpr int kKC = 256;
+};
+
 }  // namespace mma
 }  // namespace cpu_ops

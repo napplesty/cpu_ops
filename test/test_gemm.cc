@@ -59,7 +59,11 @@ void ref_gemm(int m, int n, int k, T alpha, const std::vector<T>& A, int lda,
   }
 }
 
-template <typename T, typename LA, typename LB, typename LC>
+template <typename T, typename LA, typename LB, typename LC,
+          typename Config =
+              typename cpu_ops::gemm::device::detail::GemmDefaults<T>::Config,
+          typename Policy =
+              typename cpu_ops::gemm::device::detail::GemmDefaults<T>::Policy>
 void run_case(int m, int n, int k, T alpha, T beta, bool relu, int num_threads) {
   ++g_cases;
   // Padded leading dimensions on purpose: the library must not assume
@@ -87,7 +91,9 @@ void run_case(int m, int n, int k, T alpha, T beta, bool relu, int num_threads) 
   ref_gemm<T, LA, LB, LC>(m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, D_ref, ldc, bound,
                           relu);
 
-  using Gemm = cpu_ops::gemm::device::Gemm<T, LA, T, LB, T, LC>;
+  using Gemm = cpu_ops::gemm::device::Gemm<T, LA, T, LB, T, LC, T,
+                                           cpu_ops::epilogue::LinearCombination<T>, Config,
+                                           Policy>;
   typename Gemm::Arguments args{{m, n, k},
                                 {A.data(), lda},
                                 {B.data(), ldb},
@@ -137,18 +143,30 @@ void run_case(int m, int n, int k, T alpha, T beta, bool relu, int num_threads) 
   }
 }
 
-template <typename T>
+template <typename T,
+          typename Config =
+              typename cpu_ops::gemm::device::detail::GemmDefaults<T>::Config,
+          typename Policy =
+              typename cpu_ops::gemm::device::detail::GemmDefaults<T>::Policy>
 void run_all_layouts(int m, int n, int k, T alpha, T beta, bool relu, int num_threads) {
   using cpu_ops::layout::ColumnMajor;
   using cpu_ops::layout::RowMajor;
-  run_case<T, RowMajor, RowMajor, RowMajor>(m, n, k, alpha, beta, relu, num_threads);
-  run_case<T, RowMajor, RowMajor, ColumnMajor>(m, n, k, alpha, beta, relu, num_threads);
-  run_case<T, RowMajor, ColumnMajor, RowMajor>(m, n, k, alpha, beta, relu, num_threads);
-  run_case<T, RowMajor, ColumnMajor, ColumnMajor>(m, n, k, alpha, beta, relu, num_threads);
-  run_case<T, ColumnMajor, RowMajor, RowMajor>(m, n, k, alpha, beta, relu, num_threads);
-  run_case<T, ColumnMajor, RowMajor, ColumnMajor>(m, n, k, alpha, beta, relu, num_threads);
-  run_case<T, ColumnMajor, ColumnMajor, RowMajor>(m, n, k, alpha, beta, relu, num_threads);
-  run_case<T, ColumnMajor, ColumnMajor, ColumnMajor>(m, n, k, alpha, beta, relu, num_threads);
+  run_case<T, RowMajor, RowMajor, RowMajor, Config, Policy>(m, n, k, alpha, beta, relu,
+                                                            num_threads);
+  run_case<T, RowMajor, RowMajor, ColumnMajor, Config, Policy>(m, n, k, alpha, beta, relu,
+                                                               num_threads);
+  run_case<T, RowMajor, ColumnMajor, RowMajor, Config, Policy>(m, n, k, alpha, beta, relu,
+                                                               num_threads);
+  run_case<T, RowMajor, ColumnMajor, ColumnMajor, Config, Policy>(m, n, k, alpha, beta,
+                                                                  relu, num_threads);
+  run_case<T, ColumnMajor, RowMajor, RowMajor, Config, Policy>(m, n, k, alpha, beta, relu,
+                                                               num_threads);
+  run_case<T, ColumnMajor, RowMajor, ColumnMajor, Config, Policy>(m, n, k, alpha, beta,
+                                                                  relu, num_threads);
+  run_case<T, ColumnMajor, ColumnMajor, RowMajor, Config, Policy>(m, n, k, alpha, beta,
+                                                                  relu, num_threads);
+  run_case<T, ColumnMajor, ColumnMajor, ColumnMajor, Config, Policy>(m, n, k, alpha, beta,
+                                                                     relu, num_threads);
 }
 
 // Forced split-k: split_k_slices in Arguments, including slice counts that do
@@ -303,6 +321,24 @@ int main() {
   check_thread_determinism<float>(129, 255, 96);
   check_thread_determinism<double>(96, 130, 40);
   check_status<float>();
+
+  // The 512-bit f32 policy (the platform default on AVX-512F hosts), pinned
+  // explicitly so it is covered on every host through the portable
+  // Vec<float, 16> fallback.
+  {
+    using cpu_ops::mma::Fma512GemmConfig;
+    using cpu_ops::mma::Fma512Policy;
+    for (const ShapeCfg& s : shapes) {
+      for (int threads : {1, 8}) {
+        run_all_layouts<float, Fma512GemmConfig, Fma512Policy>(s.m, s.n, s.k, 1.0f, 0.0f,
+                                                               false, threads);
+        run_all_layouts<float, Fma512GemmConfig, Fma512Policy>(s.m, s.n, s.k, 2.0f, -0.5f,
+                                                               false, threads);
+      }
+    }
+    run_all_layouts<float, Fma512GemmConfig, Fma512Policy>(32, 32, 8192, 2.0f, -0.25f,
+                                                           true, 8);
+  }
 
   std::printf("test_gemm: %d cases, %d failures\n", g_cases, g_failures);
   return g_failures == 0 ? 0 : 1;

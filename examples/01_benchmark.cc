@@ -100,9 +100,52 @@ double bench_cpu_ops_int8(int m, int n, int k, int num_threads, int reps) {
   return 2.0 * m * n * k / seconds / 1e9;
 }
 
+// Narrow-input (f16/bf16) -> f32 GEMM path. StorageT is the on-disk element
+// type; compute and the epilogue run in f32.
+template <typename StorageT, typename Gemm>
+double bench_cpu_ops_half(int m, int n, int k, int num_threads, int reps) {
+  std::vector<StorageT> A(static_cast<size_t>(m) * k), B(static_cast<size_t>(k) * n);
+  std::vector<float> C(static_cast<size_t>(m) * n, 0.0f);
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  for (auto& x : A) x = StorageT(dist(rng));
+  for (auto& x : B) x = StorageT(dist(rng));
+
+  typename Gemm::Arguments args{{m, n, k},
+                                {A.data(), k},
+                                {B.data(), n},
+                                {C.data(), n},
+                                {C.data(), n},
+                                {1.0f, 0.0f}};
+  Gemm gemm;
+  gemm(args, num_threads);  // warmup
+  const double seconds = time_best([&] { gemm(args, num_threads); }, reps);
+  const volatile float sink = C[static_cast<size_t>(m) * n / 2];
+  (void)sink;
+  return 2.0 * m * n * k / seconds / 1e9;
+}
+
 }  // namespace
 
 int main() {
+  // Report the SIMD ISA this translation unit was compiled for (the library
+  // is header-only, so the consumer's flags decide the active paths).
+#if defined(CPU_OPS_SIMD_AVX512BF16)
+  std::printf("ISA: AVX-512F + VNNI + BF16\n");
+#elif defined(CPU_OPS_SIMD_AVX512F)
+  std::printf("ISA: AVX-512F\n");
+#elif defined(CPU_OPS_SIMD_VNNI)
+  std::printf("ISA: AVX2 + VNNI\n");
+#elif defined(CPU_OPS_SIMD_AVX2)
+  std::printf("ISA: AVX2\n");
+#elif defined(CPU_OPS_SIMD_SVE)
+  std::printf("ISA: ARM SVE-%d\n", __ARM_FEATURE_SVE_BITS);
+#elif defined(CPU_OPS_SIMD_NEON)
+  std::printf("ISA: ARM NEON\n");
+#else
+  std::printf("ISA: scalar\n");
+#endif
+
   const int sizes[] = {512, 1024, 2048};
   const int threads[] = {1, 2, 4, 8};
 
@@ -129,6 +172,38 @@ int main() {
       std::fflush(stdout);
     }
     std::printf("\n");
+  }
+
+  {
+    namespace layout = cpu_ops::layout;
+    using GemmF16 = cpu_ops::gemm::device::GemmF16F32<layout::RowMajor, layout::RowMajor,
+                                                      layout::RowMajor>;
+    using GemmBF16 = cpu_ops::gemm::device::GemmBF16F32<layout::RowMajor, layout::RowMajor,
+                                                        layout::RowMajor>;
+    std::printf("\nf16 -> f32 GFLOPS:\n");
+    std::printf("%12s | %8s %8s %8s %8s\n", "size", "1T", "2T", "4T", "8T");
+    std::printf("-------------+----------------------------------------\n");
+    for (int s : {1024, 2048}) {
+      std::printf("%4d^3 GFLOPS |", s);
+      for (int t : threads) {
+        std::printf(" %8.1f",
+                    bench_cpu_ops_half<cpu_ops::float16_t, GemmF16>(s, s, s, t, 3));
+        std::fflush(stdout);
+      }
+      std::printf("\n");
+    }
+    std::printf("\nbf16 -> f32 GFLOPS (native vdpbf16ps on AVX512-BF16):\n");
+    std::printf("%12s | %8s %8s %8s %8s\n", "size", "1T", "2T", "4T", "8T");
+    std::printf("-------------+----------------------------------------\n");
+    for (int s : {1024, 2048}) {
+      std::printf("%4d^3 GFLOPS |", s);
+      for (int t : threads) {
+        std::printf(" %8.1f",
+                    bench_cpu_ops_half<cpu_ops::bfloat16_t, GemmBF16>(s, s, s, t, 3));
+        std::fflush(stdout);
+      }
+      std::printf("\n");
+    }
   }
   return 0;
 }

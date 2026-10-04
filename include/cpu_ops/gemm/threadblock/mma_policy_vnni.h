@@ -111,6 +111,7 @@ struct MmaAtomVnni {
   }
 };
 
+template <int VLEN = simd::native_width<int32_t>()>
 struct VnniPolicy {
   using ElemA = uint8_t;
   using ElemB = int8_t;
@@ -122,7 +123,7 @@ struct VnniPolicy {
   static constexpr int pad_kc(int kc) { return (kc + 3) & ~3; }
 
   template <int MR, int NR>
-  using Atom = MmaAtomVnni<MR, NR>;
+  using Atom = MmaAtomVnni<MR, NR, VLEN>;
 
   template <typename LayoutA>
   static void pack_a(TensorRef<const uint8_t, LayoutA> a, int i0, int k0, int mc, int kc,

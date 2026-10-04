@@ -31,6 +31,28 @@ struct GemmConfig {
   static constexpr int kKC = 256;
 };
 
+namespace detail {
+
+// ISA-dependent defaults of the primary Gemm template. On AVX-512F hosts the
+// f32 mainloop switches to 512-bit vectors and a deeper register tile
+// (Fma512Policy); all other element types keep the AVX2-tuned FmaPolicy
+// shapes. Explicit Config_/MmaPolicy_ template arguments always override.
+template <typename T>
+struct GemmDefaults {
+  using Config = GemmConfig<T>;
+  using Policy = mma::FmaPolicy<T>;
+};
+
+#if defined(CPU_OPS_SIMD_AVX512F)
+template <>
+struct GemmDefaults<float> {
+  using Config = mma::Fma512GemmConfig;
+  using Policy = mma::Fma512Policy;
+};
+#endif
+
+}  // namespace detail
+
 // Multithreaded GEMM:
 //   D = alpha * A * B + beta * C   (optionally fused with an activation)
 //
@@ -42,8 +64,8 @@ struct GemmConfig {
 template <typename ElementA_, typename LayoutA_, typename ElementB_, typename LayoutB_,
           typename ElementC_, typename LayoutC_, typename ElementAccumulator_ = ElementC_,
           typename Epilogue_ = epilogue::LinearCombination<ElementC_>,
-          typename Config_ = GemmConfig<ElementC_>,
-          typename MmaPolicy_ = mma::FmaPolicy<ElementC_>>
+          typename Config_ = typename detail::GemmDefaults<ElementC_>::Config,
+          typename MmaPolicy_ = typename detail::GemmDefaults<ElementC_>::Policy>
 class Gemm {
  public:
   using ElementA = ElementA_;
@@ -125,16 +147,24 @@ class Gemm {
 template <typename LayoutA, typename LayoutB, typename LayoutC>
 using GemmU8S8S32 = Gemm<uint8_t, LayoutA, int8_t, LayoutB, int32_t, LayoutC, int32_t,
                          epilogue::LinearCombination<int32_t>, GemmConfig<int32_t>,
-                         mma::VnniPolicy>;
+                         mma::VnniPolicy<>>;
 
 // Half-precision input GEMM with f32 accumulation and f32 output
 // (C/D, alpha/beta are float). A/B are widened to f32 at pack time, so the
 // compute itself runs on the f32 FMA path; what halves is operand memory
-// traffic, not arithmetic width.
+// traffic, not arithmetic width. On AVX-512F hosts the compute runs on
+// 512-bit vectors (VLEN = 16), matching the f32 default.
+#if defined(CPU_OPS_SIMD_AVX512F)
+template <typename LayoutA, typename LayoutB, typename LayoutC>
+using GemmF16F32 = Gemm<float16_t, LayoutA, float16_t, LayoutB, float, LayoutC, float,
+                        epilogue::LinearCombination<float>, mma::Fma512GemmConfig,
+                        mma::WidenPolicy<float16_t, 16>>;
+#else
 template <typename LayoutA, typename LayoutB, typename LayoutC>
 using GemmF16F32 = Gemm<float16_t, LayoutA, float16_t, LayoutB, float, LayoutC, float,
                         epilogue::LinearCombination<float>, GemmConfig<float>,
                         mma::WidenPolicy<float16_t>>;
+#endif
 
 // Same, with bfloat16 operands. With AVX512-BF16 the default computes
 // natively on packed bf16 pairs (vdpbf16ps, f32 accumulation): operand

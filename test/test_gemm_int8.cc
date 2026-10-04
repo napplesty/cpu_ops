@@ -45,7 +45,7 @@ void ref_gemm_int8(int m, int n, int k, int32_t alpha, const std::vector<uint8_t
 
 template <typename LA, typename LB, typename LC,
           typename Config = cpu_ops::gemm::device::GemmConfig<int32_t>,
-          typename Policy = cpu_ops::mma::VnniPolicy>
+          typename Policy = cpu_ops::mma::VnniPolicy<>>
 void run_case(int m, int n, int k, int32_t alpha, int32_t beta, bool relu,
               int num_threads) {
   ++g_cases;
@@ -150,6 +150,17 @@ void check_thread_determinism(int m, int n, int k) {
 
 }  // namespace
 
+// Tile shape of the 512-bit VNNI path (VLEN = 16): what the default policy
+// selection uses on AVX512-VNNI hosts, exercised on every host through the
+// portable Vec<int32_t, 16> fallback.
+struct Vnni512Config {
+  static constexpr int kMR = 6;
+  static constexpr int kNR = 32;
+  static constexpr int kMC = 126;  // multiple of kMR
+  static constexpr int kNC = 256;  // multiple of kNR
+  static constexpr int kKC = 256;
+};
+
 int main() {
   struct ShapeCfg {
     int m, n, k;
@@ -201,6 +212,25 @@ int main() {
     // Split-k with a slice count not dividing k.
     run_case<RowMajor, RowMajor, RowMajor, AmxGemmConfig, AmxPolicy>(32, 32, 8192, 1, 1,
                                                                      true, 8);
+  }
+
+  // The 512-bit VNNI tile shape (see Vnni512Config above).
+  {
+    using cpu_ops::layout::ColumnMajor;
+    using cpu_ops::layout::RowMajor;
+    using Vnni512 = cpu_ops::mma::VnniPolicy<16>;
+    for (const ShapeCfg& s : shapes) {
+      for (int threads : {1, 8}) {
+        run_case<RowMajor, RowMajor, RowMajor, Vnni512Config, Vnni512>(s.m, s.n, s.k, 1, 0,
+                                                                       false, threads);
+        run_case<ColumnMajor, ColumnMajor, ColumnMajor, Vnni512Config, Vnni512>(
+            s.m, s.n, s.k, 3, -2, false, threads);
+      }
+    }
+    run_case<RowMajor, RowMajor, RowMajor, Vnni512Config, Vnni512>(16, 24, 0, 1, 5, false,
+                                                                   4);
+    run_case<RowMajor, RowMajor, RowMajor, Vnni512Config, Vnni512>(32, 32, 8192, 1, 1,
+                                                                   true, 8);
   }
 
   std::printf("test_gemm_int8: %d cases, %d failures\n", g_cases, g_failures);
