@@ -8,10 +8,13 @@
 // contiguous dimension of both operands (A row-major, B column-major, the
 // usual "TN" arrangement for MX): scale blocks are contiguous 32-element
 // runs. Decoding happens at pack time; compute and accumulation are f32.
+// On AVX-512F hosts the default config widens the f32 mainloop to 512-bit
+// vectors with the Fma512 tile shape (see detail::GemmMxDefaults).
 
 #include "cpu_ops/epilogue/linear_combination.h"
 #include "cpu_ops/gemm/device/gemm.h"
 #include "cpu_ops/gemm/kernel/run_blocked.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_fma.h"
 #include "cpu_ops/gemm/threadblock/mma_policy_mx.h"
 #include "cpu_ops/gemm_coord.h"
 #include "cpu_ops/layout/matrix.h"
@@ -23,9 +26,29 @@ namespace cpu_ops {
 namespace gemm {
 namespace device {
 
+namespace detail {
+
+// ISA-dependent defaults of GemmMx. Decode at pack time is already 16-wide on
+// AVX-512F hosts; there the f32 mainloop additionally switches to 512-bit
+// vectors (VLEN = 16) and the Zen-4-tuned Fma512 tile shape, matching the
+// f32 Gemm default. Explicit Config_/MmaPolicy_ arguments always override.
+template <typename StorageA, typename StorageB>
+struct GemmMxDefaults {
+#if defined(CPU_OPS_SIMD_AVX512F)
+  using Config = mma::Fma512GemmConfig;
+  using Policy = mma::MxPolicy<StorageA, StorageB, 16>;
+#else
+  using Config = GemmConfig<float>;
+  using Policy = mma::MxPolicy<StorageA, StorageB>;
+#endif
+};
+
+}  // namespace detail
+
 template <typename StorageA_, typename StorageB_, typename LayoutC_ = layout::RowMajor,
           typename Epilogue_ = epilogue::LinearCombination<float>,
-          typename Config_ = GemmConfig<float>>
+          typename Config_ = typename detail::GemmMxDefaults<StorageA_, StorageB_>::Config,
+          typename MmaPolicy_ = typename detail::GemmMxDefaults<StorageA_, StorageB_>::Policy>
 class GemmMx {
  public:
   using StorageA = StorageA_;
@@ -33,6 +56,7 @@ class GemmMx {
   using LayoutC = LayoutC_;
   using Epilogue = Epilogue_;
   using Config = Config_;
+  using MmaPolicy = MmaPolicy_;
 
   struct Arguments {
     GemmCoord problem_size;
@@ -90,7 +114,7 @@ class GemmMx {
       return Status::kErrorInvalidArguments;
     }
 
-    using Policy = mma::MxPolicy<StorageA, StorageB>;
+    using Policy = MmaPolicy;
     return kernel::run_blocked<Policy, LayoutC, Epilogue, Config>(
         a, b, args.ref_C, args.ref_D, m, n, k, args.epilogue, args.split_k_slices,
         num_threads);

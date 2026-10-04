@@ -3,8 +3,9 @@
 // Mma policy for OCP MX block-scaled operands (fp8 e4m3/e5m2, fp4 e2m1 with
 // E8M0 scales every 32 elements along k). Packing decodes elements and
 // multiplies by the block scale, producing f32 panels; the mainloop and
-// accumulation are plain f32 FMA. A and B may use different storage types
-// (e.g. e4m3 activations with e5m2 weights).
+// accumulation are plain f32 FMA on VLEN-wide vectors (VLEN = 16, i.e.
+// 512-bit, is the device-level default on AVX-512F hosts). A and B may use
+// different storage types (e.g. e4m3 activations with e5m2 weights).
 //
 // Layout constraint (the industry-standard "TN" for MX): k is the contiguous
 // dimension of both operands — A is m x k row-major, B is k x n
@@ -270,7 +271,10 @@ void mx_pack_b(const MxTensorRef<T>& b, int k0, int j0, int kc, int nc, int nr,
 
 }  // namespace mx_detail2
 
-template <typename StorageA, typename StorageB>
+// VLEN selects the f32 mainloop vector width; the default follows
+// simd::native_width<float>() (8 with AVX2), while AVX-512F hosts get 16 from
+// the device-level defaults (see gemm/device/gemm_mx.h).
+template <typename StorageA, typename StorageB, int VLEN = simd::native_width<float>()>
 struct MxPolicy {
   static_assert(mx_detail2::is_mx_element<StorageA>::value &&
                     mx_detail2::is_mx_element<StorageB>::value,
@@ -286,7 +290,7 @@ struct MxPolicy {
   static constexpr int pad_kc(int kc) { return kc; }
 
   template <int MR, int NR>
-  using Atom = MmaAtom<float, MR, NR>;
+  using Atom = MmaAtom<float, MR, NR, VLEN>;
 
   static void pack_a(const MxTensorRef<StorageA>& a, int i0, int k0, int mc, int kc,
                      int /*kc_pad*/, int mr, float* dst) {

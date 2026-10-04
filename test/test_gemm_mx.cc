@@ -146,7 +146,11 @@ void fill_operand(std::mt19937& rng, uint8_t* data, uint8_t* scales, int rows, i
   }
 }
 
-template <typename T, typename LC>
+template <typename T, typename LC,
+          typename Config =
+              typename cpu_ops::gemm::device::detail::GemmMxDefaults<T, T>::Config,
+          typename Policy =
+              typename cpu_ops::gemm::device::detail::GemmMxDefaults<T, T>::Policy>
 void run_case(int m, int n, int k, float alpha, float beta, int num_threads,
               int split_k_slices = 0) {
   ++g_cases;
@@ -192,7 +196,7 @@ void run_case(int m, int n, int k, float alpha, float beta, int num_threads,
   }
 
   using cpu_ops::gemm::device::GemmMx;
-  using Op = GemmMx<T, T, LC>;
+  using Op = GemmMx<T, T, LC, cpu_ops::epilogue::LinearCombination<float>, Config, Policy>;
   typename Op::Arguments args;
   args.problem_size = {m, n, k};
   args.ref_A = {A.data(), SA.data(), lda, ldsa};
@@ -287,6 +291,23 @@ int main() {
   run_case<fp8e4m3_t, cpu_ops::layout::RowMajor>(24, 40, 3000, 1.25f, 0.5f, 8, 7);
   run_case<fp8e5m2_t, cpu_ops::layout::RowMajor>(24, 40, 3000, 1.25f, 0.5f, 8, 7);
   run_case<fp4e2m1_t, cpu_ops::layout::RowMajor>(24, 40, 2998, 1.25f, 0.5f, 8, 7);
+
+  // 512-bit mainloop (VLEN = 16, Fma512 tile shape): the device-level default
+  // on AVX-512F hosts; elsewhere the portable Vec<float, 16> fallback gives
+  // the same coverage.
+  using cpu_ops::mma::Fma512GemmConfig;
+  using cpu_ops::mma::MxPolicy;
+  for (const ShapeCfg& s : shapes) {
+    for (int threads : {1, 8}) {
+      run_case<fp8e4m3_t, cpu_ops::layout::RowMajor, Fma512GemmConfig,
+               MxPolicy<fp8e4m3_t, fp8e4m3_t, 16>>(s.m, s.n, s.k, 1.0f, 0.25f, threads);
+      run_case<fp8e5m2_t, cpu_ops::layout::RowMajor, Fma512GemmConfig,
+               MxPolicy<fp8e5m2_t, fp8e5m2_t, 16>>(s.m, s.n, s.k, 1.0f, 0.25f, threads);
+      run_case<fp4e2m1_t, cpu_ops::layout::RowMajor, Fma512GemmConfig,
+               MxPolicy<fp4e2m1_t, fp4e2m1_t, 16>>(s.m, s.n, s.k & ~1, 1.0f, 0.25f,
+                                                  threads);
+    }
+  }
 
   check_status();
 
