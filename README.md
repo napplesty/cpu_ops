@@ -163,6 +163,9 @@ gemm(args);
 - 解码在打包循环内做（AVX2 下 e4m3 用 F16C 位技巧、e2m1 用 PSHUFB 查表；
   AVX512F 下同一套技巧 16 路宽，经 `_mm512_cvtph_ps` 转换），标量回退走
   constexpr 查找表。所有 SIMD 解码与标量**逐位一致**。
+- 主循环为 f32 FMA：AVX-512F 主机上默认 512 位向量 + Fma512 tile
+  （`detail::GemmMxDefaults`，Zen 4 实测比 AVX2 默认快 ~1.2×，与 f32 路径
+  算力持平）；显式传 `Config` / `MmaPolicy` 模板参数可覆盖。
 - 同格式与交叉格式组合都在调用处按需实例化（header-only），无预编译对象。
 
 ### 激活 / 归一化 / TopK（ops 层）
@@ -248,7 +251,7 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `Gemm<double, ...>` | f64×f64 → f64 | f64 FMA |
 | `GemmU8S8S32` | u8×s8 → s32 | VNNI `vpdpbusd`（4 路字节点积）；ARM dotprod/i8mm；AMX-INT8 policy 可选（实验性） |
 | `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32 走 FMA；bf16 在 AVX512-BF16 上默认走 `vdpbf16ps` 原生点积 |
-| `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA |
+| `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA（AVX-512F 上默认 512 位主循环） |
 | `attention::Attention<T>`（示例） | f32/f16/bf16 → 同型 | QKᵀ + online softmax + PV 融合，f32 累加 |
 | `attention::MlaAttention<T>`（示例） | 共享 latent cache → 每 head 输出 | 吸收式：2×GEMM + fused 核心（dim_v ≠ dim） |
 | `attention::DsaAttention<T>`（示例） | latent cache + indexer → 每 head 输出 | 稀疏式：indexer 打分 + 精确 top-k + CLS + 无 pack 行核 |
@@ -363,8 +366,9 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
 - GEMV 无专用 kernel，单线程 GEMV 约为 OpenBLAS 的 0.5x。
 - 单线程 kernel 相对 OpenBLAS 有 0.82–0.92x 的差距，来自微内核调优深度。
 - ARM 路径（NEON / SVE2 / SME）尚未在大规模部署中验证，SME 为实验性。
-- AVX512-BF16 / AVX512F-MX 解码 / AMX-INT8 路径在本机（无对应指令集）仅经编译
-  检查与算法级等效验证（AVX2/标量复刻、qemu ARM 探针），未在真机运行。
+- AMX-INT8 路径无对应硬件，仅经编译检查与算法级等效验证（标量复刻），未在
+  真机运行。AVX512-BF16 / AVX512F（f32/f16 512 位主循环、int8 512 位 VNNI、
+  MX 16 路解码 + 512 位主循环）已在 Ryzen 9 7900X（Zen 4）实测。
 - 稠密 attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低
   （MLA 下尤甚）。稀疏行核的窄存→f32 已有向量宽化原语（`simd::widen_f16/
   widen_bf16`，NEON `vcvt`/`vshll`、AVX2 F16C/移位）+ indexer 按 8 头分块
@@ -406,9 +410,9 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
 | 平台 | 数据类型 | 指令 |
 |---|---|---|
 | x86-64 AVX2+FMA | f32 / f64 / f16 / bf16 / mxfp8 / mxfp4 | `vfmadd`（f16 转换用 F16C；MX 解码用 F16C+PSHUFB 快路径） |
-| x86 AVX-VNNI / AVX512-VNNI | u8×s8→s32 | `vpdpbusd` |
-| x86 AVX512-BF16 | bf16→f32 | `vdpbf16ps`（`GemmBF16F32` 默认；编译验证，本机无硬件未运行） |
-| x86 AVX512F | mxfp8 / mxfp4 解码 | `_mm512_cvtph_ps` 16 路宽（算法经 AVX2 复刻逐位验证；真机未运行） |
+| x86 AVX-VNNI / AVX512-VNNI | u8×s8→s32 | `vpdpbusd`（AVX512-VNNI 下默认 512 位 tile） |
+| x86 AVX512F | f32 / f16→f32 / mxfp8 / mxfp4 | f32 主循环默认 512 位 FMA（f32/f16/MX，Zen 4 实测）；MX 解码 `_mm512_cvtph_ps` 16 路宽 |
+| x86 AVX512-BF16 | bf16→f32 | `vdpbf16ps`（`GemmBF16F32` 默认；Zen 4 实测） |
 | x86 AMX-INT8（实验性，opt-in） | u8×s8→s32 | `tdpbusd` 16×16 瓦片（编译验证 + 打包布局经标量回退精确验证；真机未运行） |
 | ARM NEON | f32 | `vfmaq_f32` |
 | ARM dotprod / i8mm | u8×s8→s32 | `vdotq_u32`（偏置技巧）/ `vusdotq_s32`（qemu 探针逐位验证） |
