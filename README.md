@@ -9,7 +9,7 @@ CPU 高性能 GEMM 模板库：SIMD 微内核 + cache 分块 + 多线程。C++17
 - f16 / bf16 输入 GEMM（f32 累加 / 输出）：打包时转 f32；AVX512-BF16 上 bf16
   走 `vdpbf16ps` 原生点积（默认自动切换）
 - MX 格式 GEMM（mxfp8 e4m3/e5m2、mxfp4 e2m1 + E8M0 块缩放）：解码后走 f32 FMA
-  （AVX512F 上解码 16 路宽）
+  （AVX512F 上解码 16 路宽）；另有 opt-in 的 VNNI int8 点积路径（e2m1 精确）
 - 组装式算子开发（CUTLASS 式）：fused attention（GQA/MHA/MQA）、MLA
   （DeepSeek 吸收式）、DSA（DeepSeek-V3.2 稀疏注意力）、CSA（NSA 式
   压缩稀疏注意力）与 KDA（Kimi Delta Attention，naive/chunk 双模式）
@@ -166,6 +166,13 @@ gemm(args);
 - 主循环为 f32 FMA：AVX-512F 主机上默认 512 位向量 + Fma512 tile
   （`detail::GemmMxDefaults`，Zen 4 实测比 AVX2 默认快 ~1.2×，与 f32 路径
   算力持平）；显式传 `Config` / `MmaPolicy` 模板参数可覆盖。
+- opt-in VNNI 路径（`GemmMxE4M3Vnni` / `GemmMxE5M2Vnni` / `GemmMxE2M1Vnni`，或
+  显式 `MmaPolicy = mma::MxVnniPolicy<SA, SB>`）：打包时把每个 32 元素块按块内
+  最大值重量化为 int8（2 的幂量化子，A 侧 +128 偏移成 u8），主循环用
+  `vpdpbusd` 字节点积——块内 int32 点积精确，逐块转 f32 按 wA·wB 缩放累加。
+  e2m1 始终**精确**；e4m3/e5m2 块内动态范围超 int8 预算时小元素被舍入（每元素
+  误差 ≤ amax/128，与同数据做逐块 int8 量化相当）；不传播 inf/nan。
+  AVX512-VNNI 主机上默认 512 位 tile。
 - 同格式与交叉格式组合都在调用处按需实例化（header-only），无预编译对象。
 
 ### 激活 / 归一化 / TopK（ops 层）
@@ -252,6 +259,7 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `GemmU8S8S32` | u8×s8 → s32 | VNNI `vpdpbusd`（4 路字节点积）；ARM dotprod/i8mm；AMX-INT8 policy 可选（实验性） |
 | `GemmF16F32` / `GemmBF16F32` | f16/bf16 → f32（f32 累加） | 打包时转 f32 走 FMA；bf16 在 AVX512-BF16 上默认走 `vdpbf16ps` 原生点积 |
 | `GemmMxE4M3` / `GemmMxE5M2` / `GemmMxE2M1` | mxfp8/mxfp4 → f32 | 打包时 SIMD 解码 ×E8M0 块缩放，走 f32 FMA（AVX-512F 上默认 512 位主循环） |
+| `GemmMxE4M3Vnni` / `GemmMxE5M2Vnni` / `GemmMxE2M1Vnni` | mxfp8/mxfp4 → f32 | opt-in：块内 int8 重量化 + `vpdpbusd` 点积 + 逐块 f32 缩放（e2m1 精确） |
 | `attention::Attention<T>`（示例） | f32/f16/bf16 → 同型 | QKᵀ + online softmax + PV 融合，f32 累加 |
 | `attention::MlaAttention<T>`（示例） | 共享 latent cache → 每 head 输出 | 吸收式：2×GEMM + fused 核心（dim_v ≠ dim） |
 | `attention::DsaAttention<T>`（示例） | latent cache + indexer → 每 head 输出 | 稀疏式：indexer 打分 + 精确 top-k + CLS + 无 pack 行核 |
@@ -262,9 +270,10 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `ops::topk_indices` | f32 → int32[k] | MSD radix-select，与 partial_sort 逐位同语义 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
-乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同（例外：AVX512-BF16 目标上
+乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同（两个例外：AVX512-BF16 目标上
 bf16 默认改用 `vdpbf16ps`，每条指令完成 32 次乘加，峰值约为 f32 的 2×——本机无
-该指令集，未实测）。
+该指令集，未实测；MX 可 opt-in `MxVnniPolicy` 改用 `vpdpbusd` int8 点积，峰值
+同样约为 f32 的 2×，Zen 4 实测见下）。
 
 ## 性能
 
@@ -312,6 +321,16 @@ split-k 效果（8T，`split_k_slices` 强制值对比，GFLOPS）：
 低精度类型在小 K / 大 M 形状上领先 f32 最多 ~15%（省内存流量），方阵打平
 （都已算力受限）；深 k 极小输出（32×32×8192）MX 路径有解码开销，比 f32 慢
 ~20–30%。
+
+MX-VNNI opt-in 路径（Ryzen 9 7900X，Zen 4 AVX512-VNNI，GFLOPS）：
+
+| size | e4m3 1T / 8T | e5m2 1T / 8T | e2m1 1T / 8T |
+|---|---|---|---|
+| 1024³ | 269 / 798 | 273 / 868 | 272 / 817 |
+| 2048³ | 286 / 1490 | 287 / 1372 | 292 / 1535 |
+
+同机 MX f32 路径 2048³ 为 133 / 971（e4m3），即 VNNI 路径 1T ~2.1×、8T
+~1.5×；8T 下同时超过 bf16 原生 `vdpbf16ps`（1138）与 f32 FMA（964）。
 
 融合 epilogue（2048³ 8T，bias+ReLU）：与无融合的 GEMM 相比开销 ≈ 0；比
 「GEMM + 单独逐元素 pass」快 ~8%（省一遍 C 的读写扫描）。
@@ -367,8 +386,9 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
 - 单线程 kernel 相对 OpenBLAS 有 0.82–0.92x 的差距，来自微内核调优深度。
 - ARM 路径（NEON / SVE2 / SME）尚未在大规模部署中验证，SME 为实验性。
 - AMX-INT8 路径无对应硬件，仅经编译检查与算法级等效验证（标量复刻），未在
-  真机运行。AVX512-BF16 / AVX512F（f32/f16 512 位主循环、int8 512 位 VNNI、
-  MX 16 路解码 + 512 位主循环）已在 Ryzen 9 7900X（Zen 4）实测。
+  真机运行。AVX512-BF16 / AVX512F / AVX512-VNNI（f32/f16 512 位主循环、int8
+  512 位 VNNI、MX 16 路解码 + 512 位主循环、MX-VNNI int8 点积）已在
+  Ryzen 9 7900X（Zen 4）实测。
 - 稠密 attention decode（seq_q 很小）复用通用查询面板路径，带宽利用率低
   （MLA 下尤甚）。稀疏行核的窄存→f32 已有向量宽化原语（`simd::widen_f16/
   widen_bf16`，NEON `vcvt`/`vshll`、AVX2 F16C/移位）+ indexer 按 8 头分块
@@ -410,7 +430,7 @@ M=1 行核算力执行（见「已知限制」）。（数字来自 `examples/*_
 | 平台 | 数据类型 | 指令 |
 |---|---|---|
 | x86-64 AVX2+FMA | f32 / f64 / f16 / bf16 / mxfp8 / mxfp4 | `vfmadd`（f16 转换用 F16C；MX 解码用 F16C+PSHUFB 快路径） |
-| x86 AVX-VNNI / AVX512-VNNI | u8×s8→s32 | `vpdpbusd`（AVX512-VNNI 下默认 512 位 tile） |
+| x86 AVX-VNNI / AVX512-VNNI | u8×s8→s32；mxfp8/mxfp4（opt-in `MxVnniPolicy`） | `vpdpbusd`（AVX512-VNNI 下默认 512 位 tile；MX 为块内 int8 重量化 + 逐块 f32 缩放） |
 | x86 AVX512F | f32 / f16→f32 / mxfp8 / mxfp4 | f32 主循环默认 512 位 FMA（f32/f16/MX，Zen 4 实测）；MX 解码 `_mm512_cvtph_ps` 16 路宽 |
 | x86 AVX512-BF16 | bf16→f32 | `vdpbf16ps`（`GemmBF16F32` 默认；Zen 4 实测） |
 | x86 AMX-INT8（实验性，opt-in） | u8×s8→s32 | `tdpbusd` 16×16 瓦片（编译验证 + 打包布局经标量回退精确验证；真机未运行） |
@@ -474,6 +494,7 @@ include/cpu_ops/
 │       ├── mma_policy_vnni.h        # int8 点积 policy + 微内核 + 打包
 │       ├── mma_policy_widen.h       # f16/bf16 → f32 打包转换 policy
 │       ├── mma_policy_mx.h          # MX 格式解码 policy（AVX2 / AVX512F SIMD 解码快路径）
+│       ├── mma_policy_mx_vnni.h     # MX opt-in VNNI policy：块内 int8 重量化 + vpdpbusd
 │       ├── mma_policy_bf16.h        # AVX512-BF16 原生点积 policy（vdpbf16ps）+ 打包
 │       ├── mma_policy_amx.h         # AMX-INT8 瓦片 policy（实验性，opt-in，含标量回退）
 │       ├── mma_policy_sme.h         # ARM SME FMOPA policy（实验性）
