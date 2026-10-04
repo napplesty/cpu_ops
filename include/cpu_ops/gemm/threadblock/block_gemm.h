@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <type_traits>
 
 #include "cpu_ops/layout/matrix.h"
@@ -34,6 +35,26 @@ constexpr bool kVecStoreEnabled = false;
 constexpr bool kVecStoreEnabled = true;
 #endif
 
+// Policies whose packed strips carry trailing per-strip metadata (the MX-VNNI
+// policy appends per-block f32 scales) override the strip stride; the default
+// is kc_pad * tile elements of PackedA/PackedB.
+template <typename P, typename = void>
+struct panel_stride_a {
+  static constexpr int get(int kc_pad, int tile) { return kc_pad * tile; }
+};
+template <typename P>
+struct panel_stride_a<P, std::void_t<decltype(P::panel_stride_a(0, 0))>> {
+  static constexpr int get(int kc_pad, int tile) { return P::panel_stride_a(kc_pad, tile); }
+};
+template <typename P, typename = void>
+struct panel_stride_b {
+  static constexpr int get(int kc_pad, int tile) { return kc_pad * tile; }
+};
+template <typename P>
+struct panel_stride_b<P, std::void_t<decltype(P::panel_stride_b(0, 0))>> {
+  static constexpr int get(int kc_pad, int tile) { return P::panel_stride_b(kc_pad, tile); }
+};
+
 // The full-tile fast path streams the accumulator straight from registers
 // into C/D with vector epilogue application. Requires a row-major C/D, a
 // vector-capable epilogue, and a register-exposing atom.
@@ -55,9 +76,10 @@ struct can_vector_store<A, E, L, std::void_t<typename A::VecT>>
 //         pack A panel (mc x kc)
 //         macro-kernel over MR x NR micro-tiles
 //
-// buf_a must hold round_up(MC, MR) * pad_kc(KC) PackedA elements, buf_b must
-// hold round_up(NC, NR) * pad_kc(KC) PackedB elements (panels are padded up to
-// whole micro-tiles, and k is padded to the policy's k step). The epilogue is
+// buf_a must hold kPackBufAElems PackedA elements and buf_b kPackBufBElems
+// PackedB elements (one panel: whole micro-tile strips of kc_pad x MR/NR,
+// plus the policy's per-strip metadata where it has any). k is padded to the
+// policy's k step. The epilogue is
 // invoked per output element per k-block with
 // (acc, source, first_k_block, last_k_block).
 //
@@ -78,6 +100,13 @@ struct BlockGemm {
   static constexpr int kKC = Config::kKC;
   static constexpr int kMCPadded = ((kMC + kMR - 1) / kMR) * kMR;
   static constexpr int kNCPadded = ((kNC + kNR - 1) / kNR) * kNR;
+
+  static constexpr int kKCPadded = Policy::pad_kc(kKC);
+  // Pack buffer sizes, in PackedA/PackedB elements, for one full panel.
+  static constexpr std::size_t kPackBufAElems =
+      static_cast<std::size_t>(kMCPadded / kMR) * panel_stride_a<Policy>::get(kKCPadded, kMR);
+  static constexpr std::size_t kPackBufBElems =
+      static_cast<std::size_t>(kNCPadded / kNR) * panel_stride_b<Policy>::get(kKCPadded, kNR);
 
   using Atom = typename Policy::template Atom<kMR, kNR>;
 
@@ -110,11 +139,13 @@ struct BlockGemm {
                            int i0, int j0, int mc, int nc, int kc_pad, bool first,
                            bool last, const Epilogue& epilogue) {
     constexpr bool kFastStore = can_vector_store<Atom, Epilogue, LayoutC>::value;
+    const int stride_a = panel_stride_a<Policy>::get(kc_pad, kMR);
+    const int stride_b = panel_stride_b<Policy>::get(kc_pad, kNR);
     for (int jr = 0; jr < nc; jr += kNR) {
-      const PackedB* bstrip = pb + (jr / kNR) * kc_pad * kNR;
+      const PackedB* bstrip = pb + static_cast<std::size_t>(jr / kNR) * stride_b;
       const int jmax = (nc - jr < kNR) ? (nc - jr) : kNR;
       for (int ir = 0; ir < mc; ir += kMR) {
-        const PackedA* astrip = pa + (ir / kMR) * kc_pad * kMR;
+        const PackedA* astrip = pa + static_cast<std::size_t>(ir / kMR) * stride_a;
         const int imax = (mc - ir < kMR) ? (mc - ir) : kMR;
         Atom atom;
         if constexpr (kFastStore) {

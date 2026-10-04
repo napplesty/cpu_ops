@@ -47,8 +47,9 @@ add_library(cpu_ops_header_check OBJECT ${CPU_OPS_HEADER_CHECK_SOURCES})
 target_link_libraries(cpu_ops_header_check PRIVATE cpu_ops cpu_ops_build_flags)
 
 # Optional compile check for ISA-gated kernels this host cannot run: builds
-# the AVX512-BF16 / AMX policies and the 512-bit MX decode for recent x86
-# targets to keep those headers compile-clean (no execution).
+# the AVX512-BF16 / AMX policies, the 512-bit MX decode and the MX-VNNI
+# policy for recent x86 targets to keep those headers compile-clean
+# (no execution).
 if(CPU_OPS_ISA_COMPILE_CHECK)
   include(CheckCXXCompilerFlag)
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -63,7 +64,13 @@ if(CPU_OPS_ISA_COMPILE_CHECK)
          "    epilogue::LinearCombination<float>, mma::Bf16GemmConfig, mma::Bf16Policy>;\n"
          "template class gemm::device::Gemm<uint8_t, layout::RowMajor, int8_t,\n"
          "    layout::RowMajor, int32_t, layout::RowMajor, int32_t,\n"
-         "    epilogue::LinearCombination<int32_t>, mma::AmxGemmConfig, mma::AmxPolicy>;\n")
+         "    epilogue::LinearCombination<int32_t>, mma::AmxGemmConfig, mma::AmxPolicy>;\n"
+         "template class gemm::device::GemmMx<fp8e4m3_t, fp8e4m3_t, layout::RowMajor,\n"
+         "    epilogue::LinearCombination<float>, mma::Vnni512GemmConfig,\n"
+         "    mma::MxVnniPolicy<fp8e4m3_t, fp8e4m3_t>>;\n"
+         "template class gemm::device::GemmMx<fp4e2m1_t, fp4e2m1_t, layout::RowMajor,\n"
+         "    epilogue::LinearCombination<float>, mma::Vnni512GemmConfig,\n"
+         "    mma::MxVnniPolicy<fp4e2m1_t, fp4e2m1_t>>;\n")
     foreach(isa sapphirerapids icelake-server)
       string(REPLACE "-" "_" isa_id ${isa})
       check_cxx_compiler_flag(-march=${isa} CPU_OPS_HAS_MARCH_${isa_id})

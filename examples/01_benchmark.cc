@@ -127,10 +127,11 @@ double bench_cpu_ops_half(int m, int n, int k, int num_threads, int reps) {
 }
 
 // MX block-scaled path (fp8 e4m3/e5m2, fp4 e2m1 + E8M0 scales every 32
-// elements along k): operands are decoded and scaled into f32 panels at pack
-// time, then the mainloop is plain f32 FMA.
-template <typename T>
-double bench_cpu_ops_mx(int m, int n, int k, int num_threads, int reps) {
+// elements along k). The default operator decodes and scales into f32 panels
+// at pack time, then runs an f32 FMA mainloop; the GemmMx*Vnni aliases run
+// the opt-in int8 dot-product policy instead.
+template <typename T, typename Gemm>
+double bench_cpu_ops_mx_op(int m, int n, int k, int num_threads, int reps) {
   namespace layout = cpu_ops::layout;
   constexpr bool is_fp4 = std::is_same<T, cpu_ops::fp4e2m1_t>::value;
   const int row_bytes = is_fp4 ? k / 2 : k;  // k is even in the shapes below
@@ -158,7 +159,6 @@ double bench_cpu_ops_mx(int m, int n, int k, int num_threads, int reps) {
   fill(A.data(), m);
   fill(B.data(), n);
 
-  using Gemm = cpu_ops::gemm::device::GemmMx<T, T, layout::RowMajor>;
   typename Gemm::Arguments args{{m, n, k},
                                 {A.data(), SA.data(), k, kg},
                                 {B.data(), SB.data(), k, kg},
@@ -171,6 +171,13 @@ double bench_cpu_ops_mx(int m, int n, int k, int num_threads, int reps) {
   const volatile float sink = C[static_cast<size_t>(m) * n / 2];
   (void)sink;
   return 2.0 * m * n * k / seconds / 1e9;
+}
+
+template <typename T>
+double bench_cpu_ops_mx(int m, int n, int k, int num_threads, int reps) {
+  namespace layout = cpu_ops::layout;
+  return bench_cpu_ops_mx_op<T, cpu_ops::gemm::device::GemmMx<T, T, layout::RowMajor>>(
+      m, n, k, num_threads, reps);
 }
 
 }  // namespace
@@ -288,6 +295,51 @@ int main() {
       std::fflush(stdout);
     }
     std::printf("\n");
+  }
+
+  // The opt-in VNNI policies: per-block int8 requantization, byte dot
+  // products, f32 block scaling (e2m1 is exact; see mma_policy_mx_vnni.h).
+  {
+    namespace device = cpu_ops::gemm::device;
+    std::printf("\nmxfp8 e4m3 -> f32 GFLOPS (VNNI int8 dot, opt-in):\n");
+    std::printf("%12s | %8s %8s %8s %8s\n", "size", "1T", "2T", "4T", "8T");
+    std::printf("-------------+----------------------------------------\n");
+    for (int s : {1024, 2048}) {
+      std::printf("%4d^3 GFLOPS |", s);
+      for (int t : threads) {
+        std::printf(" %8.1f",
+                    bench_cpu_ops_mx_op<cpu_ops::fp8e4m3_t, device::GemmMxE4M3Vnni<>>(
+                        s, s, s, t, 3));
+        std::fflush(stdout);
+      }
+      std::printf("\n");
+    }
+    std::printf("\nmxfp8 e5m2 -> f32 GFLOPS (VNNI int8 dot, opt-in):\n");
+    std::printf("%12s | %8s %8s %8s %8s\n", "size", "1T", "2T", "4T", "8T");
+    std::printf("-------------+----------------------------------------\n");
+    for (int s : {1024, 2048}) {
+      std::printf("%4d^3 GFLOPS |", s);
+      for (int t : threads) {
+        std::printf(" %8.1f",
+                    bench_cpu_ops_mx_op<cpu_ops::fp8e5m2_t, device::GemmMxE5M2Vnni<>>(
+                        s, s, s, t, 3));
+        std::fflush(stdout);
+      }
+      std::printf("\n");
+    }
+    std::printf("\nmxfp4 e2m1 -> f32 GFLOPS (VNNI int8 dot, exact, opt-in):\n");
+    std::printf("%12s | %8s %8s %8s %8s\n", "size", "1T", "2T", "4T", "8T");
+    std::printf("-------------+----------------------------------------\n");
+    for (int s : {1024, 2048}) {
+      std::printf("%4d^3 GFLOPS |", s);
+      for (int t : threads) {
+        std::printf(" %8.1f",
+                    bench_cpu_ops_mx_op<cpu_ops::fp4e2m1_t, device::GemmMxE2M1Vnni<>>(
+                        s, s, s, t, 3));
+        std::fflush(stdout);
+      }
+      std::printf("\n");
+    }
   }
   return 0;
 }

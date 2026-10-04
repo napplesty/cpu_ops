@@ -2,6 +2,7 @@
 // GemmMx: decode tables are checked against exact values, GEMM results
 // against a double-precision reference over the decoded (exact) operands.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -226,6 +227,122 @@ void run_case(int m, int n, int k, float alpha, float beta, int num_threads,
   }
 }
 
+// Exact reference for the MX-VNNI policy: every absolute 32-element block is
+// requantized with the policy's own scalar helper, then the integer dot
+// products are accumulated exactly in double. Valid only when all panel and
+// slice k boundaries are 32-aligned (the kernel's segments then coincide with
+// the absolute blocks); fp4 e2m1 quantizes exactly regardless of
+// segmentation, so its cases may also use misaligned forced slices.
+template <typename T, typename LC, typename Config, typename Policy>
+void run_case_vnni(int m, int n, int k, float alpha, float beta, int num_threads,
+                   int split_k_slices) {
+  ++g_cases;
+  const bool is_fp4 = std::is_same<T, fp4e2m1_t>::value;
+  const int lda = (k + 3) & ~(is_fp4 ? 1 : 0);
+  const int ldb = (k + 3) & ~(is_fp4 ? 1 : 0);
+  const int ldc = (LC::kIsRowMajor ? n : m) + 3;
+  const int kg = (k + 31) / 32;
+  const int ldsa = kg + 1, ldsb = kg + 1;
+
+  std::vector<uint8_t> A(static_cast<size_t>(m) * (lda / (is_fp4 ? 2 : 1)), 0);
+  std::vector<uint8_t> B(static_cast<size_t>(n) * (ldb / (is_fp4 ? 2 : 1)), 0);
+  std::vector<uint8_t> SA(static_cast<size_t>(m) * ldsa, 0);
+  std::vector<uint8_t> SB(static_cast<size_t>(n) * ldsb, 0);
+  const size_t size_c = static_cast<size_t>(LC::kIsRowMajor ? m : n) * ldc;
+  std::vector<float> C(size_c, 0.f), D(size_c, std::numeric_limits<float>::quiet_NaN());
+
+  std::mt19937 rng(static_cast<unsigned>(m * 131 + n * 17 + k));
+  fill_operand<T>(rng, A.data(), SA.data(), m, k, lda, ldsa);
+  fill_operand<T>(rng, B.data(), SB.data(), n, k, ldb, ldsb);
+  std::uniform_real_distribution<float> cdist(-1.f, 1.f);
+  for (auto& x : C) x = cdist(rng);
+
+  // Per-block requantization with the kernel's own helper (bit-identical).
+  struct QBlock {
+    int8_t q[32];
+    double w;
+    int32_t qsum;
+  };
+  const int nblocks = (k + 31) / 32;
+  auto quantize_all = [&](const uint8_t* data, const uint8_t* scales, int rows, int ld,
+                          int lds) {
+    std::vector<QBlock> out(static_cast<size_t>(rows) * nblocks);
+    for (int r = 0; r < rows; ++r) {
+      for (int b = 0; b < nblocks; ++b) {
+        float v[32];
+        const int len = std::min(32, k - b * 32);
+        for (int t = 0; t < len; ++t) v[t] = decode_elem<T>(data, r, b * 32 + t, ld);
+        QBlock& qb = out[static_cast<size_t>(r) * nblocks + b];
+        const int qexp = cpu_ops::mma::mxvnni_detail::quantize_block_i8(v, len, qb.q);
+        qb.w = static_cast<double>(
+                   e8m0_to_float(scales[static_cast<size_t>(r) * lds + b])) *
+               std::ldexp(1.0, qexp);
+        qb.qsum = 0;
+        for (int t = 0; t < 32; ++t) qb.qsum += qb.q[t];
+      }
+    }
+    return out;
+  };
+  const std::vector<QBlock> QA = quantize_all(A.data(), SA.data(), m, lda, ldsa);
+  const std::vector<QBlock> QB = quantize_all(B.data(), SB.data(), n, ldb, ldsb);
+
+  std::vector<double> D_ref(static_cast<size_t>(m) * n), bound(static_cast<size_t>(m) * n);
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < n; ++j) {
+      double acc = 0.0, bnd = 0.0;
+      for (int b = 0; b < nblocks; ++b) {
+        const QBlock& xa = QA[static_cast<size_t>(i) * nblocks + b];
+        const QBlock& xb = QB[static_cast<size_t>(j) * nblocks + b];
+        long long idp = 0, absq = 0;
+        for (int t = 0; t < 32; ++t) {
+          idp += static_cast<int>(xa.q[t]) * static_cast<int>(xb.q[t]);
+          absq += std::abs(static_cast<int>(xa.q[t]) * static_cast<int>(xb.q[t]));
+        }
+        acc += xa.w * xb.w * static_cast<double>(idp);
+        bnd += std::fabs(xa.w * xb.w) *
+               (static_cast<double>(absq) + 128.0 * std::abs(xb.qsum));
+      }
+      double v = static_cast<double>(alpha) * acc;
+      if (beta != 0.f) v += static_cast<double>(beta) * C[LC::offset(i, j, ldc)];
+      D_ref[static_cast<size_t>(i) * n + j] = v;
+      bound[static_cast<size_t>(i) * n + j] = bnd;
+    }
+  }
+
+  using cpu_ops::gemm::device::GemmMx;
+  using Op = GemmMx<T, T, LC, cpu_ops::epilogue::LinearCombination<float>, Config, Policy>;
+  typename Op::Arguments args;
+  args.problem_size = {m, n, k};
+  args.ref_A = {A.data(), SA.data(), lda, ldsa};
+  args.ref_B = {B.data(), SB.data(), ldb, ldsb};
+  args.ref_C = {C.data(), ldc};
+  args.ref_D = {D.data(), ldc};
+  args.epilogue = {alpha, beta};
+  args.split_k_slices = split_k_slices;
+  Op op;
+  CHECK(op(args, num_threads) == cpu_ops::Status::kSuccess,
+        "vnni %s (%dx%dx%d) threads=%d slices=%d: bad status", MxLab<T>::name(), m, n, k,
+        num_threads, split_k_slices);
+
+  // The per-block math is exact up to one f32 rounding per block (products
+  // and scale factors are powers of two times < 2^21 integers), so the
+  // accumulation tolerance of the f32 path applies per block.
+  const double eps = std::numeric_limits<float>::epsilon();
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < n; ++j) {
+      const size_t off = static_cast<size_t>(LC::offset(i, j, ldc));
+      const double want = D_ref[static_cast<size_t>(i) * n + j];
+      const double allowed = 8.0 * nblocks * eps * bound[static_cast<size_t>(i) * n + j] +
+                             16.0 * eps * std::fabs(want) + 1e-12;
+      const double err = std::fabs(static_cast<double>(D[off]) - want);
+      CHECK(err <= allowed, "vnni %s (%dx%dx%d) a=%g b=%g threads=%d slices=%d C(%d,%d): "
+                            "got %g want %g",
+            MxLab<T>::name(), m, n, k, (double)alpha, (double)beta, num_threads,
+            split_k_slices, i, j, static_cast<double>(D[off]), want);
+    }
+  }
+}
+
 void check_status() {
   ++g_cases;
   using cpu_ops::layout::RowMajor;
@@ -308,6 +425,52 @@ int main() {
                                                   threads);
     }
   }
+
+  // MX-VNNI policy (per-block int8 requantization + byte dot products). All
+  // cases keep panel/slice k boundaries 32-aligned so the exact quantized
+  // reference applies; fp4 e2m1 quantizes exactly regardless of segmentation,
+  // so it also covers a misaligned forced split. slices=1 forces the unsplit
+  // path (these k depths would not auto-split anyway).
+  using cpu_ops::gemm::device::GemmConfig;
+  using cpu_ops::layout::RowMajor;
+  using cpu_ops::mma::MxVnniPolicy;
+  using cpu_ops::mma::Vnni512GemmConfig;
+  for (const ShapeCfg& s : shapes) {
+    for (int threads : {1, 8}) {
+      run_case_vnni<fp8e4m3_t, RowMajor, GemmConfig<int32_t>,
+                    MxVnniPolicy<fp8e4m3_t, fp8e4m3_t>>(s.m, s.n, s.k, 1.0f, 0.25f,
+                                                       threads, 1);
+      run_case_vnni<fp8e5m2_t, RowMajor, GemmConfig<int32_t>,
+                    MxVnniPolicy<fp8e5m2_t, fp8e5m2_t>>(s.m, s.n, s.k, 0.5f, -0.5f,
+                                                       threads, 1);
+      run_case_vnni<fp4e2m1_t, RowMajor, GemmConfig<int32_t>,
+                    MxVnniPolicy<fp4e2m1_t, fp4e2m1_t>>(s.m, s.n, s.k & ~1, 1.0f,
+                                                       0.25f, threads, 1);
+    }
+  }
+  // 512-bit VNNI tile shape (VLEN = 16): the alias default on AVX512-VNNI
+  // hosts, covered elsewhere through the portable vector fallbacks.
+  for (const ShapeCfg& s : shapes) {
+    for (int threads : {1, 8}) {
+      run_case_vnni<fp8e4m3_t, RowMajor, Vnni512GemmConfig,
+                    MxVnniPolicy<fp8e4m3_t, fp8e4m3_t, 16>>(s.m, s.n, s.k, 1.0f, 0.25f,
+                                                           threads, 1);
+      run_case_vnni<fp8e5m2_t, RowMajor, Vnni512GemmConfig,
+                    MxVnniPolicy<fp8e5m2_t, fp8e5m2_t, 16>>(s.m, s.n, s.k, 1.0f, 0.25f,
+                                                           threads, 1);
+      run_case_vnni<fp4e2m1_t, RowMajor, Vnni512GemmConfig,
+                    MxVnniPolicy<fp4e2m1_t, fp4e2m1_t, 16>>(s.m, s.n, s.k & ~1, 1.0f,
+                                                           0.25f, threads, 1);
+    }
+  }
+  // Deep-k split-k: aligned forced slices (exact reference applies to fp8 as
+  // well), and a misaligned forced split for the exactly-quantized fp4.
+  run_case_vnni<fp8e4m3_t, RowMajor, Vnni512GemmConfig,
+                MxVnniPolicy<fp8e4m3_t, fp8e4m3_t, 16>>(32, 32, 4096, 1.0f, 0.5f, 8, 8);
+  run_case_vnni<fp4e2m1_t, RowMajor, Vnni512GemmConfig,
+                MxVnniPolicy<fp4e2m1_t, fp4e2m1_t, 16>>(32, 32, 4096, 1.0f, 0.5f, 8, 8);
+  run_case_vnni<fp4e2m1_t, RowMajor, GemmConfig<int32_t>,
+                MxVnniPolicy<fp4e2m1_t, fp4e2m1_t>>(24, 40, 2998, 1.25f, 0.5f, 8, 7);
 
   check_status();
 

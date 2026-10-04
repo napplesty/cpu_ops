@@ -16,6 +16,7 @@
 #include "cpu_ops/gemm/kernel/run_blocked.h"
 #include "cpu_ops/gemm/threadblock/mma_policy_fma.h"
 #include "cpu_ops/gemm/threadblock/mma_policy_mx.h"
+#include "cpu_ops/gemm/threadblock/mma_policy_mx_vnni.h"
 #include "cpu_ops/gemm_coord.h"
 #include "cpu_ops/layout/matrix.h"
 #include "cpu_ops/mx_formats.h"
@@ -128,6 +129,39 @@ template <typename LayoutC = layout::RowMajor>
 using GemmMxE5M2 = GemmMx<fp8e5m2_t, fp8e5m2_t, LayoutC>;
 template <typename LayoutC = layout::RowMajor>
 using GemmMxE2M1 = GemmMx<fp4e2m1_t, fp4e2m1_t, LayoutC>;
+
+// Opt-in VNNI variants: per-block int8 requantization + byte dot products
+// (vpdpbusd) instead of the exact f32 decode — see mma_policy_mx_vnni.h for
+// the numerics trade-off (e2m1 exact; e4m3/e5m2 per-block int8 accuracy; no
+// inf/nan). Tile shapes follow the int8 VNNI GEMM defaults (512-bit on
+// AVX512-VNNI hosts).
+#if defined(CPU_OPS_SIMD_AVX512VNNI)
+template <typename LayoutC = layout::RowMajor>
+using GemmMxE4M3Vnni =
+    GemmMx<fp8e4m3_t, fp8e4m3_t, LayoutC, epilogue::LinearCombination<float>,
+           mma::Vnni512GemmConfig, mma::MxVnniPolicy<fp8e4m3_t, fp8e4m3_t>>;
+template <typename LayoutC = layout::RowMajor>
+using GemmMxE5M2Vnni =
+    GemmMx<fp8e5m2_t, fp8e5m2_t, LayoutC, epilogue::LinearCombination<float>,
+           mma::Vnni512GemmConfig, mma::MxVnniPolicy<fp8e5m2_t, fp8e5m2_t>>;
+template <typename LayoutC = layout::RowMajor>
+using GemmMxE2M1Vnni =
+    GemmMx<fp4e2m1_t, fp4e2m1_t, LayoutC, epilogue::LinearCombination<float>,
+           mma::Vnni512GemmConfig, mma::MxVnniPolicy<fp4e2m1_t, fp4e2m1_t>>;
+#else
+template <typename LayoutC = layout::RowMajor>
+using GemmMxE4M3Vnni =
+    GemmMx<fp8e4m3_t, fp8e4m3_t, LayoutC, epilogue::LinearCombination<float>,
+           GemmConfig<int32_t>, mma::MxVnniPolicy<fp8e4m3_t, fp8e4m3_t>>;
+template <typename LayoutC = layout::RowMajor>
+using GemmMxE5M2Vnni =
+    GemmMx<fp8e5m2_t, fp8e5m2_t, LayoutC, epilogue::LinearCombination<float>,
+           GemmConfig<int32_t>, mma::MxVnniPolicy<fp8e5m2_t, fp8e5m2_t>>;
+template <typename LayoutC = layout::RowMajor>
+using GemmMxE2M1Vnni =
+    GemmMx<fp4e2m1_t, fp4e2m1_t, LayoutC, epilogue::LinearCombination<float>,
+           GemmConfig<int32_t>, mma::MxVnniPolicy<fp4e2m1_t, fp4e2m1_t>>;
+#endif
 
 }  // namespace device
 }  // namespace gemm

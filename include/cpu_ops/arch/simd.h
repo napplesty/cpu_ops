@@ -138,6 +138,19 @@ inline Vec<int32_t, N> dpbusd(Vec<int32_t, N> acc, Vec<int32_t, N> a, Vec<int32_
   return acc;
 }
 
+// Lane-wise int32 -> f32 conversion (the MX int8 dot-product policy converts
+// each block's integer dot product before applying the f32 block scales).
+// The portable form round-trips through memory so it works for any mix of
+// generic and specialized Vec instantiations.
+template <int N>
+inline Vec<float, N> cvtepi32_ps(Vec<int32_t, N> x) {
+  int32_t ti[N];
+  float tf[N];
+  x.store(ti);
+  for (int i = 0; i < N; ++i) tf[i] = static_cast<float>(ti[i]);
+  return Vec<float, N>::load(tf);
+}
+
 // 2-way bf16 dot product accumulated per f32 lane: each lane's 32 bits hold
 // two packed bf16 k-slices (low half = the even k, high half = k + 1). The
 // products are exact in f32 (8-bit mantissas), matching vdpbf16ps semantics
@@ -509,6 +522,8 @@ inline Vec<int32_t, 8> dpbusd(Vec<int32_t, 8> acc, Vec<int32_t, 8> a, Vec<int32_
   return acc;
 }
 
+inline Vec<float, 8> cvtepi32_ps(Vec<int32_t, 8> x) { return _mm256_cvtepi32_ps(x.v); }
+
 inline Vec<int32_t, 8> mul(const Vec<int32_t, 8>& a, const Vec<int32_t, 8>& b) {
   return _mm256_mullo_epi32(a.v, b.v);
 }
@@ -612,6 +627,8 @@ inline Vec<int32_t, 16> dpbusd(Vec<int32_t, 16> acc, Vec<int32_t, 16> a,
   acc.v = _mm512_dpbusd_epi32(acc.v, a.v, b.v);
   return acc;
 }
+
+inline Vec<float, 16> cvtepi32_ps(Vec<int32_t, 16> x) { return _mm512_cvtepi32_ps(x.v); }
 
 inline Vec<int32_t, 16> mul(const Vec<int32_t, 16>& a, const Vec<int32_t, 16>& b) {
   return _mm512_mullo_epi32(a.v, b.v);
@@ -841,6 +858,8 @@ inline Vec<int32_t, 4> max(const Vec<int32_t, 4>& a, const Vec<int32_t, 4>& b) {
 inline Vec<int32_t, 4> min(const Vec<int32_t, 4>& a, const Vec<int32_t, 4>& b) {
   return vminq_s32(a.v, b.v);
 }
+
+inline Vec<float, 4> cvtepi32_ps(Vec<int32_t, 4> x) { return vcvtq_f32_s32(x.v); }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 // Exact u8 x s8 -> s32 4-way dot product in one instruction (ARMv8.6 i8mm).

@@ -125,11 +125,8 @@ Status run_blocked(const RefA& a, const RefB& b,
   using Block = threadblock::BlockGemm<Policy, LayoutC, Epilogue, Config>;
   using PackedA = typename Policy::PackedA;
   using PackedB = typename Policy::PackedB;
-  constexpr int kKCPadded = Policy::pad_kc(Config::kKC);
-  constexpr std::size_t buf_a_elems =
-      static_cast<std::size_t>(Block::kMCPadded) * kKCPadded;
-  constexpr std::size_t buf_b_elems =
-      static_cast<std::size_t>(Block::kNCPadded) * kKCPadded;
+  constexpr std::size_t buf_a_elems = Block::kPackBufAElems;
+  constexpr std::size_t buf_b_elems = Block::kPackBufBElems;
 
   if (k_slices > 1) {
     // Phase 1: every region reduces its k slice into its own partial-sum slab
