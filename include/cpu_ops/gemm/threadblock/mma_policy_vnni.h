@@ -1,13 +1,11 @@
 #pragma once
 
-// Mma policy for quantized GEMM: uint8 x int8 -> int32, accumulating 4 k
-// slices per 32-bit lane with a byte dot-product instruction (AVX-VNNI /
-// AVX512-VNNI via simd::dpbusd; portable scalar fallback otherwise).
+// Mma policy for quantized GEMM: uint8 x int8 -> int32, 4 k slices per 32-bit
+// lane via byte dot-product (simd::dpbusd; portable scalar fallback otherwise).
 //
-// Packed layouts (kc is padded up to a multiple of 4; padded k-slices are 0):
+// Packed layouts (kc padded up to a multiple of 4; padded k-slices are 0):
 //   A panel, per strip of MR rows:  dst[(g * MR + i) * 4 + t] = A(i, 4g + t)
 //   B panel, per strip of NR cols:  dst[(g * NR + j) * 4 + t] = B(4g + t, j)
-// i.e. 4 consecutive k bytes sit in one 32-bit lane, matching dpbusd.
 
 #include <cstdint>
 #include <cstring>
@@ -61,8 +59,6 @@ void pack_b_vnni(const TensorRef<const int8_t, LayoutB>& b, int k0, int j0, int 
 
 namespace mma {
 
-// Micro-kernel: MR x NR int32 accumulators; per k-group of 4 it broadcasts one
-// packed A word per row and dot-products it with NR/8 packed B vectors.
 template <int MR_, int NR_, int VLEN = simd::native_width<int32_t>()>
 struct MmaAtomVnni {
   static constexpr int kMR = MR_;
@@ -103,7 +99,6 @@ struct MmaAtomVnni {
       for (int w = 0; w < kVecN; ++w) acc[i][w].store(tile + i * kNR + w * VLEN);
   }
 
-  // Single-entry form used by the macro kernel: clear, accumulate, spill.
   void run(const uint8_t* a, const int8_t* b, int kc_pad, int32_t* tile) {
     clear();
     mma(a, b, kc_pad);
@@ -139,14 +134,12 @@ struct VnniPolicy {
   }
 };
 
-// Tile config for the 512-bit VNNI path (VLEN = 16): MR x NR = 8 x 32 with
-// 16 of 32 ZMM as accumulators. NC/KC tuned on Zen 4 (B panel = 512 KiB).
-// Used by GemmU8S8S32 only when CPU_OPS_SIMD_AVX512VNNI is set.
+// Tile config for the 512-bit VNNI path, used only when CPU_OPS_SIMD_AVX512VNNI is set.
 struct Vnni512GemmConfig {
   static constexpr int kMR = 8;
   static constexpr int kNR = 32;
-  static constexpr int kMC = 128;   // multiple of kMR
-  static constexpr int kNC = 1024;  // multiple of kNR
+  static constexpr int kMC = 128;
+  static constexpr int kNC = 1024;
   static constexpr int kKC = 512;
 };
 

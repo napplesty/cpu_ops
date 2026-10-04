@@ -90,12 +90,10 @@ struct ThreadPoolImpl {
 
 }  // namespace detail
 
-// Persistent thread pool. The global instance sizes itself to
-// std::thread::hardware_concurrency(); worker threads are created lazily on
-// first use and joined at process exit.
-//
-// parallel_for is not re-entrant and not safe to call concurrently from
-// multiple user threads; callers get serialized through an internal mutex.
+// Persistent thread pool sized to hardware_concurrency(); workers are created
+// lazily on first use and joined at process exit. parallel_for is not
+// re-entrant; concurrent calls from multiple user threads are serialized
+// through an internal mutex.
 class ThreadPool {
  public:
   static ThreadPool& global() {

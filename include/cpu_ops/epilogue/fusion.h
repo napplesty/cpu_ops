@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "cpu_ops/arch/simd.h"
+#include "cpu_ops/epilogue/linear_combination.h"
 
 namespace cpu_ops {
 namespace epilogue {
@@ -38,8 +39,7 @@ struct Relu {
   }
 };
 
-// x -> gelu(x), tanh approximation (matches ops::gelu):
-//   0.5x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+// x -> gelu(x), tanh approximation (matches ops::gelu).
 struct Gelu {
   template <typename T>
   T operator()(T x, int /*row*/, int /*col*/) const {
@@ -163,15 +163,8 @@ struct Chain {
 
 // GEMM epilogue with a fused op chain:
 //   D(i,j) = chain(alpha * acc + beta * C(i,j))   on the final k-block.
-//
 // Drop-in replacement for LinearCombination (same epilogue concept); use it as
-// the Epilogue template argument of gemm::device::Gemm, see
-// gemm/device/gemm_fused.h.
-//
-// Like LinearCombination, the linear-combination arithmetic is pinned to
-// explicit fma forms (see linear_combination.h) so that every instantiation
-// context — inlined or type-erased — rounds identically; the chain then runs
-// on top unchanged.
+// the Epilogue template argument of gemm::device::Gemm (gemm/device/gemm_fused.h).
 template <typename T, typename... Ops>
 struct LinearCombinationFused {
   struct Params {
@@ -186,59 +179,18 @@ struct LinearCombinationFused {
   explicit LinearCombinationFused(const Params& p) : params(p) {}
 
   T operator()(T acc, T source, bool first, bool last, int row, int col) const {
-    T value = combine(acc, source, first);
+    T value = detail::linear_combine(params.alpha, params.beta, acc, source, first);
     if (last) value = params.chain.apply(value, row, col);
     return value;
   }
 
-  // Lane-wise form of operator(); mirrors the scalar form fma-for-fma.
   template <int N>
   simd::Vec<T, N> apply_vec(simd::Vec<T, N> acc, simd::Vec<T, N> source, bool first,
                             bool last, int row, int col) const {
-    simd::Vec<T, N> value = combine_vec(acc, source, first);
+    simd::Vec<T, N> value =
+        detail::linear_combine_vec(params.alpha, params.beta, acc, source, first);
     if (last) value = params.chain.apply_vec(value, row, col);
     return value;
-  }
-
- private:
-  T combine(T acc, T source, bool first) const {
-    if constexpr (std::is_floating_point<T>::value) {
-      if (first) {
-        return params.beta != T(0)
-                   ? std::fma(params.beta, source, params.alpha * acc)
-                   : params.alpha * acc;
-      }
-      return std::fma(params.alpha, acc, source);
-    } else {
-      if (first) {
-        return params.beta != T(0) ? params.alpha * acc + params.beta * source
-                                   : params.alpha * acc;
-      }
-      return source + params.alpha * acc;
-    }
-  }
-
-  template <int N>
-  simd::Vec<T, N> combine_vec(simd::Vec<T, N> acc, simd::Vec<T, N> source,
-                              bool first) const {
-    using V = simd::Vec<T, N>;
-    const V alpha = V::set1(params.alpha);
-    if constexpr (std::is_floating_point<T>::value) {
-      if (first) {
-        return params.beta != T(0)
-                   ? simd::fmadd(V::set1(params.beta), source, simd::mul(alpha, acc))
-                   : simd::mul(alpha, acc);
-      }
-      return simd::fmadd(alpha, acc, source);
-    } else {
-      if (first) {
-        return params.beta != T(0)
-                   ? simd::add(simd::mul(alpha, acc),
-                               simd::mul(V::set1(params.beta), source))
-                   : simd::mul(alpha, acc);
-      }
-      return simd::add(source, simd::mul(alpha, acc));
-    }
   }
 };
 

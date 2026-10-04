@@ -1,18 +1,8 @@
 #pragma once
 
 // Elementwise activation kernels: gelu (tanh approximation) and silu.
-//
-// Compute is f32 on the SIMD lanes; storage may be f32, float16_t or
-// bfloat16_t (narrow inputs widen at load; narrow outputs round to
-// nearest-even scalar-wise — a vector f32->bf16 RNE convert is future
-// work). Buffers may alias (y == x).
-//
-// gelu is the tanh approximation  0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))
-// — PyTorch's approximate="tanh" — matching the epilogue::Gelu op; the
-// exact-erf variant is deliberately not provided (see epilogue/fusion.h).
-//
-// Determinism: fixed lane formulas and a fixed elementwise mapping —
-// bit-identical for any thread count (task split covers disjoint ranges).
+// Compute is f32; narrow outputs round to nearest-even. Buffers may alias
+// (y == x). Determinism: bit-identical for any thread count.
 
 #include <algorithm>
 #include <cstddef>
@@ -58,8 +48,6 @@ void elementwise(const T* x, T* y, std::size_t n, F&& lane_fn, int num_threads) 
     }
   };
 
-  // Coarse contiguous slices (a parallel_for wave per p tasks costs tens of
-  // microseconds; fine-grained waves would swamp millisecond-scale rows).
   const int max_tasks = std::max(1, p * 8);
   const std::size_t per = (n + max_tasks - 1) / max_tasks;
   const int n_tasks = static_cast<int>((n + per - 1) / per);
@@ -81,7 +69,6 @@ void elementwise(const T* x, T* y, std::size_t n, F&& lane_fn, int num_threads) 
 
 }  // namespace activation_detail
 
-// y[i] = gelu(x[i])  (tanh approximation)
 template <typename T>
 Status gelu(const T* x, T* y, std::size_t n, int num_threads = 0) {
   if (!x || !y) return Status::kErrorInvalidArguments;
@@ -90,7 +77,6 @@ Status gelu(const T* x, T* y, std::size_t n, int num_threads = 0) {
   return Status::kSuccess;
 }
 
-// y[i] = silu(x[i]) = x[i] * sigmoid(x[i])
 template <typename T>
 Status silu(const T* x, T* y, std::size_t n, int num_threads = 0) {
   if (!x || !y) return Status::kErrorInvalidArguments;

@@ -248,7 +248,8 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
   **逐位一致**（int8 是精确整数；f32/f64/f16/bf16/MX 的浮点求和顺序固定——split-k
   的部分和也按 slice 顺序归约）。
 - 自定义 tile 配置 / epilogue / mma policy：`gemm/device/gemm.h` 自带完整定义，
-  直接在自己的编译单元实例化 `Gemm<...>` 特化即可。
+  直接在自己的编译单元实例化 `Gemm<...>` 特化即可；组件组装在实例化时由
+  `gemm/contract.h` 的 static_assert 逐项校验（类型匹配、atom 形态、pack 签名）。
 
 ## 数据类型
 
@@ -267,7 +268,7 @@ MLA 在其上多两层 GEMM 编排（吸收/反吸收），核心调用是
 | `attention::KdaAttention<T>`（示例） | q/k/v + β/λ logits（+初始状态）→ 输出 + 终态 | 线性注意力：门控 delta 规则，naive/chunk 双模式 |
 | `ops::gelu/silu<T>` | T → T | f32 车道数学 + 向量 RNE 窄存 |
 | `ops::rmsnorm / fused_add_rmsnorm / layernorm<T>` | [rows×cols] → 同型 | 双累加器行统计，fused 输入一遍读完 |
-| `ops::topk_indices` | f32 → int32[k] | MSD radix-select，与 partial_sort 逐位同语义 |
+| `ops::topk_indices` | f32/f64 → int32[k] | MSD radix-select，与 partial_sort 逐位同语义 |
 
 f16 / bf16 / MX 路径的收益来自**操作数内存流量减半 / 减四**以及更小的 cache 占用；
 乘加本身仍以 f32 FMA 执行，算力上限与 f32 路径相同（两个例外：AVX512-BF16 目标上
@@ -482,6 +483,7 @@ include/cpu_ops/
 │   ├── simd.h                       # ISA 检测 + simd::Vec（AVX2/VNNI/AVX512/SVE/NEON/标量）
 │   └── mma_atom.h                   # FMA 寄存器微内核
 ├── gemm/
+│   ├── contract.h                   # 组装期契约检查（policy/config/atom/epilogue/layout traits + static_assert）
 │   ├── device/                      # device 级算子（完整定义，包含即用）
 │   │   ├── gemm.h                   # device::Gemm、GemmConfig、U8S8S32/F16/BF16 别名
 │   │   ├── gemm_fused.h             # GemmFusedF32/F64 融合 epilogue 别名

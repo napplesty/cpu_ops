@@ -1,23 +1,15 @@
 #pragma once
 
-// Mma policy for bfloat16 GEMM with native bf16 dot-product accumulation
-// (AVX512-BF16 `vdpbf16ps`): packed panels hold PAIRS of bf16 k-slices per
-// 32-bit lane, so operand memory traffic halves relative to the widening
-// policy (mma_policy_widen.h) and every instruction covers 2 k-steps x 16
-// f32 accumulator lanes.
+// Mma policy for bfloat16 GEMM on the bf16 dot product (vdpbf16ps via
+// simd::dpbf16ps): packed panels hold PAIRS of bf16 k-slices per 32-bit lane.
 //
-// Packed layouts mirror the VNNI policy with kKStep = 2 (kc is padded up to
-// even; padded k-slices are 0):
+// Packed layouts (kKStep = 2; kc padded up to even, padded k-slices are 0):
 //   A panel, per strip of MR rows:  dst[(g * MR + i) * 2 + t] = A(i, 2g + t)
 //   B panel, per strip of NR cols:  dst[(g * NR + j) * 2 + t] = B(2g + t, j)
-// i.e. two consecutive bf16 k-slices sit in one 32-bit lane, low half first,
-// matching vdpbf16ps.
+// i.e. two consecutive bf16 k-slices per 32-bit lane, low half first.
 //
-// The packing helpers are plain C++ and compile everywhere (unit-tested
-// natively). The atom runs the AVX512-BF16 fast path when
-// CPU_OPS_SIMD_AVX512BF16 is set and the portable simd::dpbf16ps fallback
-// otherwise (correct but slow) — the device-level GemmBF16F32 alias selects
-// this policy only when the ISA is present.
+// The atom uses the AVX512-BF16 fast path when CPU_OPS_SIMD_AVX512BF16 is set
+// and the portable simd::dpbf16ps fallback otherwise.
 
 #include <cstdint>
 #include <cstring>
@@ -71,10 +63,8 @@ void pack_b_bf16(const TensorRef<const bfloat16_t, LayoutB>& b, int k0, int j0, 
 
 namespace mma {
 
-// Micro-kernel: MR x NR f32 accumulators; per k-pair it broadcasts one packed
-// A word per row and dot-products it with NR/16 packed B vectors. The atom
-// always exposes its registers (VecT acc[kMR][kVecN]) so the mainloop's
-// full-tile vector-store path applies.
+// Exposes its registers (VecT acc[kMR][kVecN]) for the mainloop's full-tile
+// vector-store path.
 template <int MR_, int NR_>
 struct MmaAtomBf16 {
   static constexpr int kMR = MR_;
@@ -113,7 +103,6 @@ struct MmaAtomBf16 {
       for (int w = 0; w < kVecN; ++w) acc[i][w].store(tile + i * kNR + w * kVLEN);
   }
 
-  // Single-entry form used by the macro kernel: clear, accumulate, spill.
   void run(const uint16_t* a, const uint16_t* b, int kc_pad, float* tile) {
     clear();
     mma(a, b, kc_pad);
@@ -147,14 +136,11 @@ struct Bf16Policy {
   }
 };
 
-// Tile config for the bf16 atom: MR x NR = 8 x 32 f32 lanes (16 of 32 ZMM
-// hold accumulators). NC/KC tuned on Zen 4; the narrower operand (2 bytes)
-// lets the B panel stay resident in L2 at NC = 1024.
 struct Bf16GemmConfig {
   static constexpr int kMR = 8;
   static constexpr int kNR = 32;
-  static constexpr int kMC = 128;   // multiple of kMR
-  static constexpr int kNC = 1024;  // multiple of kNR
+  static constexpr int kMC = 128;
+  static constexpr int kNC = 1024;
   static constexpr int kKC = 512;
 };
 

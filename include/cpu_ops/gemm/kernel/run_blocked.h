@@ -12,6 +12,7 @@
 
 #include "cpu_ops/arch/simd.h"
 #include "cpu_ops/epilogue/partial_sum.h"
+#include "cpu_ops/gemm/contract.h"
 #include "cpu_ops/gemm/threadblock/block_gemm.h"
 #include "cpu_ops/gemm/threadblock/threadblock_swizzle.h"
 #include "cpu_ops/layout/matrix.h"
@@ -25,9 +26,17 @@ namespace kernel {
 
 namespace detail {
 
+// Degenerate k == 0: fold beta * C into D without touching A or B.
+template <typename T, typename LayoutC, typename Epilogue>
+void write_zero_k(TensorRef<const T, LayoutC> c, TensorRef<T, LayoutC> d, int m, int n,
+                  const Epilogue& epilogue) {
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < n; ++j) d.at(i, j) = epilogue(T(0), c.at(i, j), true, true, i, j);
+  }
+}
+
 // Combines split-k partial slabs in slice order (deterministic) and applies
 // the user epilogue exactly once per element: D = epilogue(sum_s W_s, C).
-// Slabs are row-major m x n with leading dimension n.
 template <typename T, typename LayoutC, typename Epilogue>
 inline void reduce_splitk(TensorRef<const T, LayoutC> c, TensorRef<T, LayoutC> d,
                           const T* ws, int slices, int m, int n,
@@ -75,15 +84,12 @@ Status run_blocked(const RefA& a, const RefB& b,
                    const typename Epilogue::Params& epilogue_params,
                    int split_k_slices, int num_threads) {
   using T = typename Policy::AccT;
+  static_assert(threadblock::epilogue_params<Epilogue>::value,
+                "Epilogue must provide a Params type and be constructible from it");
   const Epilogue epilogue(epilogue_params);
 
   if (k == 0) {
-    // Degenerate product: fold beta * C into D without touching A or B.
-    for (int i = 0; i < m; ++i) {
-      for (int j = 0; j < n; ++j) {
-        d.at(i, j) = epilogue(T(0), c.at(i, j), true, true, i, j);
-      }
-    }
+    detail::write_zero_k(c, d, m, n, epilogue);
     return Status::kSuccess;
   }
 
@@ -91,18 +97,10 @@ Status run_blocked(const RefA& a, const RefB& b,
   int p = num_threads <= 0 ? pool.num_threads() : std::min(num_threads, pool.num_threads());
   if (p < 1) p = 1;
 
-  // Split-k decision. Deep reductions are cut into k slices whose partial
-  // products are summed in a second pass. Splitting does two things: it
-  // creates tasks when the output grid alone cannot feed all threads, and —
-  // because each slice is partitioned across fewer threads — it coarsens the
-  // m x n grid, so A and B panels are packed fewer times. The price is a
-  // workspace of slices m x n slabs plus a reduction pass over them, so the
-  // slice count is bounded by k depth (>= 1 KC block per slice, which also
-  // guarantees non-empty slices) and by a workspace budget: measured on
-  // AVX2, splitting pays when a slab is around 1 MiB or less, is neutral at
-  // 4 MiB, and regresses beyond — the reduce pass and slab traffic outweigh
-  // the packing savings once the output grid is large. Below ~8 KC blocks of
-  // depth the extra pass does not pay for itself either.
+  // Split-k: deep reductions are cut into slices whose partial sums are
+  // combined in a second pass. Pays off only when the output grid cannot feed
+  // the threads: the extra pass and slab traffic are bounded by a workspace
+  // budget and a minimum k depth.
   constexpr std::size_t kSplitkWsBudget = 4ull << 20;
   int k_slices = 1;
   if (p > 1) {
@@ -113,7 +111,6 @@ Status run_blocked(const RefA& a, const RefB& b,
       const std::size_t slab_bytes = static_cast<std::size_t>(m) * n * sizeof(T);
       const int ws_cap = static_cast<int>(std::max<std::size_t>(
           1, kSplitkWsBudget / std::max<std::size_t>(slab_bytes, 1)));
-      // Aim for roughly two tasks per thread.
       k_slices = std::min(2 * p, ws_cap);
     }
     k_slices = std::max(1, std::min(k_slices, depth_cap));
@@ -129,8 +126,8 @@ Status run_blocked(const RefA& a, const RefB& b,
   constexpr std::size_t buf_b_elems = Block::kPackBufBElems;
 
   if (k_slices > 1) {
-    // Phase 1: every region reduces its k slice into its own partial-sum slab
-    // (row-major, no epilogue applied yet).
+    // Phase 1 writes raw partial sums per slice; phase 2 reduces them in
+    // slice order and applies the real epilogue exactly once.
     using WsEpilogue = epilogue::PartialSum<T>;
     using BlockWs = threadblock::BlockGemm<Policy, layout::RowMajor, WsEpilogue, Config>;
     const std::size_t slab_elems = static_cast<std::size_t>(m) * n;
@@ -151,7 +148,6 @@ Status run_blocked(const RefA& a, const RefB& b,
       ::operator delete(buf_b, std::align_val_t(64));
     };
     pool.parallel_for(static_cast<int>(regions.size()), job);
-    // Phase 2: deterministic ordered reduction + the real epilogue.
     detail::reduce_splitk(c, d, ws, k_slices, m, n, epilogue);
     ::operator delete(ws, std::align_val_t(64));
     return Status::kSuccess;

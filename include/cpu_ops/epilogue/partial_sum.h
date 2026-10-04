@@ -1,11 +1,8 @@
 #pragma once
 
-// Internal epilogue for split-k partial products: writes raw accumulator sums
-// (no alpha/beta, no activation, no fusion chain) into a workspace slab. The
-// reduction pass afterwards applies the user's real epilogue exactly once.
-//
-// Semantics per k-block: first block stores acc, later blocks accumulate onto
-// the slab value. `source` is the slab's current content.
+// Internal epilogue for split-k partial products: the first k-block stores acc
+// into the workspace slab, later blocks accumulate onto the slab value
+// (`source`); the reduction pass applies the real epilogue exactly once.
 
 #include "cpu_ops/arch/simd.h"
 

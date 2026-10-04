@@ -20,8 +20,7 @@ namespace gemm {
 namespace device {
 
 // Tile sizes steering the blocked mainloop. MR x NR is the register-level
-// micro-tile; MC/NC/KC are the cache-level block sizes. Packing buffers use
-// roughly MC * KC + KC * NC elements per thread.
+// micro-tile; MC/NC/KC are the cache-level block sizes.
 template <typename T>
 struct GemmConfig {
   static constexpr int kMR = 6;
@@ -33,10 +32,8 @@ struct GemmConfig {
 
 namespace detail {
 
-// ISA-dependent defaults of the primary Gemm template. On AVX-512F hosts the
-// f32 mainloop switches to 512-bit vectors and a deeper register tile
-// (Fma512Policy); all other element types keep the AVX2-tuned FmaPolicy
-// shapes. Explicit Config_/MmaPolicy_ template arguments always override.
+// ISA-dependent defaults of the primary Gemm template. Explicit
+// Config_/MmaPolicy_ template arguments always override.
 template <typename T>
 struct GemmDefaults {
   using Config = GemmConfig<T>;
@@ -53,14 +50,10 @@ struct GemmDefaults<float> {
 
 }  // namespace detail
 
-// Multithreaded GEMM:
-//   D = alpha * A * B + beta * C   (optionally fused with an activation)
-//
-// A is m x k, B is k x n, C and D are m x n. C and D may alias each other.
-// The library is header-only: including this header makes the full kernel
-// definition available, so any combination of element types, layouts,
-// epilogue, tile config, and mma policy can be instantiated in the including
-// translation unit.
+// Multithreaded GEMM: D = alpha * A * B + beta * C (fused epilogue optional).
+// A is m x k, B is k x n; C and D are m x n and may alias. Header-only: any
+// Element/Layout/Epilogue/Config/MmaPolicy combination is instantiated in the
+// including TU, and the assembly is validated at class instantiation.
 template <typename ElementA_, typename LayoutA_, typename ElementB_, typename LayoutB_,
           typename ElementC_, typename LayoutC_, typename ElementAccumulator_ = ElementC_,
           typename Epilogue_ = epilogue::LinearCombination<ElementC_>,
@@ -79,6 +72,15 @@ class Gemm {
   using Config = Config_;
   using MmaPolicy = MmaPolicy_;
 
+  static_assert(std::is_same<ElementA, typename MmaPolicy::ElemA>::value &&
+                    std::is_same<ElementB, typename MmaPolicy::ElemB>::value &&
+                    std::is_same<ElementAccumulator, typename MmaPolicy::AccT>::value &&
+                    std::is_same<ElementC, typename MmaPolicy::AccT>::value,
+                "element types must match the mma policy's ElemA/ElemB, and both the "
+                "accumulator and C must use the policy's AccT");
+  static_assert(threadblock::epilogue_params<Epilogue>::value,
+                "Epilogue must provide a Params type and be constructible from it");
+
   struct Arguments {
     GemmCoord problem_size;
     TensorRef<const ElementA, LayoutA> ref_A;
@@ -86,11 +88,8 @@ class Gemm {
     TensorRef<const ElementC, LayoutC> ref_C;
     TensorRef<ElementC, LayoutC> ref_D;
     typename Epilogue::Params epilogue;
-    // 0: automatic — deep reductions (k >= 8 * KC) are split into enough
-    //    k slices to give roughly two tasks per thread, bounded by k depth
-    //    (>= 1 KC block per slice) and a 4 MiB workspace budget;
-    // 1: never split k;
-    // >1: force this many k slices (still clamped so no slice is empty).
+    // 0: automatic; 1: never split k; >1: force this many k slices (clamped
+    // so no slice is empty).
     int split_k_slices = 0;
   };
 
@@ -98,13 +97,6 @@ class Gemm {
 
   // num_threads <= 0 selects the size of the global thread pool.
   Status operator()(const Arguments& args, int num_threads = 0) const {
-    static_assert(std::is_same<ElementA, typename MmaPolicy::ElemA>::value &&
-                      std::is_same<ElementB, typename MmaPolicy::ElemB>::value &&
-                      std::is_same<ElementAccumulator, typename MmaPolicy::AccT>::value &&
-                      std::is_same<ElementC, typename MmaPolicy::AccT>::value,
-                  "element types must match the mma policy's ElemA/ElemB, and both the "
-                  "accumulator and C must use the policy's AccT");
-
     const int m = args.problem_size.m;
     const int n = args.problem_size.n;
     const int k = args.problem_size.k;
@@ -112,14 +104,8 @@ class Gemm {
     if (m == 0 || n == 0) return Status::kSuccess;
 
     if (k == 0) {
-      // Degenerate product: fold beta * C into D without touching A or B
-      // (which are allowed to be empty in this case).
-      const Epilogue epilogue(args.epilogue);
-      for (int i = 0; i < m; ++i) {
-        for (int j = 0; j < n; ++j) {
-          args.ref_D.at(i, j) = epilogue(ElementC(0), args.ref_C.at(i, j), true, true, i, j);
-        }
-      }
+      kernel::detail::write_zero_k(args.ref_C, args.ref_D, m, n,
+                                   Epilogue(args.epilogue));
       return Status::kSuccess;
     }
 
@@ -141,11 +127,8 @@ class Gemm {
   }
 };
 
-// uint8 x int8 -> int32 quantized GEMM. Uses 4-way byte dot-product
-// accumulation (AVX-VNNI / AVX512-VNNI when available, portable scalar
-// fallback otherwise). alpha/beta are int32. On AVX512-VNNI hosts the tile
-// widens to NR = 32 of 512-bit lanes with deeper cache blocks
-// (Vnni512GemmConfig, tuned on Zen 4).
+// uint8 x int8 -> int32 quantized GEMM via 4-way byte dot products
+// (AVX-VNNI / AVX512-VNNI when available, scalar fallback otherwise).
 #if defined(CPU_OPS_SIMD_AVX512VNNI)
 template <typename LayoutA, typename LayoutB, typename LayoutC>
 using GemmU8S8S32 = Gemm<uint8_t, LayoutA, int8_t, LayoutB, int32_t, LayoutC, int32_t,
@@ -158,11 +141,8 @@ using GemmU8S8S32 = Gemm<uint8_t, LayoutA, int8_t, LayoutB, int32_t, LayoutC, in
                          mma::VnniPolicy<>>;
 #endif
 
-// Half-precision input GEMM with f32 accumulation and f32 output
-// (C/D, alpha/beta are float). A/B are widened to f32 at pack time, so the
-// compute itself runs on the f32 FMA path; what halves is operand memory
-// traffic, not arithmetic width. On AVX-512F hosts the compute runs on
-// 512-bit vectors (VLEN = 16), matching the f32 default.
+// Half-precision inputs, f32 accumulate/output: operands widen to f32 at pack
+// time (the f32 mainloop runs 512-bit on AVX-512F hosts).
 #if defined(CPU_OPS_SIMD_AVX512F)
 template <typename LayoutA, typename LayoutB, typename LayoutC>
 using GemmF16F32 = Gemm<float16_t, LayoutA, float16_t, LayoutB, float, LayoutC, float,
@@ -175,12 +155,9 @@ using GemmF16F32 = Gemm<float16_t, LayoutA, float16_t, LayoutB, float, LayoutC, 
                         mma::WidenPolicy<float16_t>>;
 #endif
 
-// Same, with bfloat16 operands. With AVX512-BF16 the default computes
-// natively on packed bf16 pairs (vdpbf16ps, f32 accumulation): operand
-// traffic halves versus widening, and numerics differ slightly from the
-// widen path — the bf16 products skip one rounding, so results are if
-// anything more accurate. Pass mma::WidenPolicy<bfloat16_t> and
-// GemmConfig<float> explicitly to force the widening path.
+// Same, with bfloat16 operands. AVX512-BF16 defaults to native vdpbf16ps dot
+// products (bf16 products skip one rounding vs the widen path); force the
+// widen path with mma::WidenPolicy<bfloat16_t> + GemmConfig<float>.
 #if defined(CPU_OPS_SIMD_AVX512BF16)
 template <typename LayoutA, typename LayoutB, typename LayoutC>
 using GemmBF16F32 = Gemm<bfloat16_t, LayoutA, bfloat16_t, LayoutB, float, LayoutC, float,

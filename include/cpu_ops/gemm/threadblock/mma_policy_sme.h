@@ -1,17 +1,9 @@
 #pragma once
 
 // EXPERIMENTAL, NOT TESTED ON HARDWARE OR EMULATOR.
-//
-// Mma policy for ARM SME (Scalable Matrix Extension): the micro-tile lives in
-// the ZA array and is accumulated by FMOPA f32 outer products. The atom is a
-// 2x2 grid of ZA 32-bit tiles, i.e. it computes a (2*SVL/32) x (2*SVL/32)
-// f32 tile (32x32 at SVL=512).
-//
-// Build requirements: aarch64, GCC 14+ or Clang 18+,
-//   -march=armv9.2-a+sme -msve-vector-bits=<128|256|512|...>
-// The library is header-only, so the SME kernel is instantiated in the
-// consumer's translation unit. The whole header is inert unless
-// __ARM_FEATURE_SME is defined together with a fixed SVE vector width.
+// Mma policy for ARM SME: f32 FMOPA outer products into a 2x2 grid of ZA
+// 32-bit tiles. Requires -march=armv9.2-a+sme -msve-vector-bits=N; the whole
+// header is inert unless __ARM_FEATURE_SME and a fixed SVE width are defined.
 
 #include "cpu_ops/arch/simd.h"
 #include "cpu_ops/gemm/threadblock/pack.h"
@@ -23,10 +15,8 @@
 namespace cpu_ops {
 namespace mma {
 
-// Micro-kernel holding a 2x2 grid of ZA 32-bit tiles. All ZA traffic happens
-// inside run(), which executes in streaming SVE mode with a fresh ZA state;
-// the accumulated tile is read out to a row-major MR x NR buffer before the
-// mode is exited on return.
+// run() executes in streaming SVE mode with a fresh ZA state and reads the
+// accumulated tile out to a row-major buffer before the mode is exited.
 template <int MR_, int NR_>
 struct MmaAtomSmeF32 {
   static constexpr int kTileRows = __ARM_FEATURE_SVE_BITS / 32;
@@ -87,7 +77,6 @@ struct SmePolicyF32 {
   }
 };
 
-// Tile config matching the SME atom: MR = NR = 2 ZA32 tile rows.
 struct SmeGemmConfigF32 {
   static constexpr int kMR = 2 * (__ARM_FEATURE_SVE_BITS / 32);
   static constexpr int kNR = kMR;

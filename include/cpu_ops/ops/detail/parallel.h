@@ -1,9 +1,7 @@
 #pragma once
 
-// Library-side batching helper for the ops layer. The pool always engages
-// all workers on parallel_for, so a thread cap is implemented by handing
-// tasks out in p-sized batches (same pattern as the assembled-operator
-// examples). Results are independent of the batch split.
+// Runs n tasks through the pool in p-sized batches (the pool always engages
+// all workers). Results are independent of the batch split.
 
 #include "cpu_ops/thread/thread_pool.h"
 

@@ -1,10 +1,10 @@
 // Tests for the ops layer: activation (gelu/silu), normalization (rmsnorm,
 // fused add+rmsnorm, layernorm) and exact top-k selection. Activations and
 // norms are checked against double references of the same formulas on the
-// storage-rounded inputs; topk is checked BITWISE against the partial_sort
-// formulation of its (value desc, index asc) contract — including
-// tie-heavy inputs and the -0/+0 float-equal case. Determinism contracts:
-// outputs are bit-identical across thread counts and across runs.
+// storage-rounded inputs; topk (f32 and f64) is checked BITWISE against the
+// partial_sort formulation of its (value desc, index asc) contract —
+// including tie-heavy inputs and the -0/+0 float-equal case. Determinism
+// contracts: outputs are bit-identical across thread counts and across runs.
 
 #include <algorithm>
 #include <chrono>
@@ -169,7 +169,8 @@ void test_norm(int threads, double tol, const char* tag) {
 }
 
 // Reference formulation of the topk contract; bitwise comparable.
-void ref_topk(const std::vector<float>& v, int k, std::vector<int32_t>* out) {
+template <typename T>
+void ref_topk(const std::vector<T>& v, int k, std::vector<int32_t>* out) {
   const int n = static_cast<int>(v.size());
   if (k > n) k = n;
   out->resize(k);
@@ -183,7 +184,8 @@ void ref_topk(const std::vector<float>& v, int k, std::vector<int32_t>* out) {
   std::memcpy(out->data(), id.data(), sizeof(int32_t) * k);
 }
 
-void test_topk_case(const char* name, const std::vector<float>& v, int k) {
+template <typename T>
+void test_topk_case(const char* name, const std::vector<T>& v, int k) {
   ++g_cases;
   if (k > (int)v.size()) k = (int)v.size();  // same clamp as the operator
   std::vector<int32_t> got(k), want;
@@ -231,7 +233,8 @@ void test_topk() {
     ++g_cases;
     std::vector<float> v(16, 0.5f);
     std::vector<int32_t> out(4);
-    CHECK(cpu_ops::ops::topk_indices(nullptr, 16, 4, out.data()) ==
+    CHECK(cpu_ops::ops::topk_indices(static_cast<const float*>(nullptr), 16, 4,
+                                     out.data()) ==
               cpu_ops::Status::kErrorInvalidArguments,
           "topk null accepted");
     CHECK(cpu_ops::ops::topk_indices(v.data(), 16, 0, out.data()) ==
@@ -241,6 +244,55 @@ void test_topk() {
     CHECK(cpu_ops::ops::topk_indices(v.data(), 16, 4, out.data()) ==
               cpu_ops::Status::kErrorInvalidArguments,
           "topk NaN accepted");
+  }
+}
+
+void test_topk_f64() {
+  std::mt19937 rng(888);
+  std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+  {  // radix path, generic random
+    std::vector<double> v(100000);
+    for (auto& x : v) x = dist(rng);
+    test_topk_case("topk_f64_random", v, 2048);
+    test_topk_case("topk_f64_k1", v, 1);
+    test_topk_case("topk_f64_kn", v, 100000);
+    test_topk_case("topk_f64_k_gt_n", v, 200000);
+  }
+  {  // tie-heavy: quantized values force exact double ties
+    std::vector<double> v(100000);
+    for (auto& x : v) x = std::floor(dist(rng) * 8.0) / 8.0;
+    test_topk_case("topk_f64_ties", v, 3333);
+    test_topk_case("topk_f64_ties_k1", v, 1);
+  }
+  {  // -0 / +0 are float-equal: tie must resolve by index
+    std::vector<double> v(5000);
+    for (int i = 0; i < 10; ++i) v[i] = 3.0 + i;
+    for (int i = 10; i < 5000; ++i)
+      v[i] = (i % 2) ? -0.0 : +0.0;  // alternating zero signs
+    test_topk_case("topk_f64_zeros", v, 500);
+    test_topk_case("topk_f64_zeros_boundary", v, 11);
+  }
+  {  // small-n path
+    std::vector<double> v(100);
+    for (auto& x : v) x = dist(rng);
+    test_topk_case("topk_f64_small", v, 17);
+  }
+  {  // error paths
+    ++g_cases;
+    std::vector<double> v(16, 0.5);
+    std::vector<int32_t> out(4);
+    CHECK(cpu_ops::ops::topk_indices(static_cast<const double*>(nullptr), 16, 4,
+                                     out.data()) ==
+              cpu_ops::Status::kErrorInvalidArguments,
+          "topk_f64 null accepted");
+    CHECK(cpu_ops::ops::topk_indices(v.data(), 16, 0, out.data()) ==
+              cpu_ops::Status::kErrorInvalidProblem,
+          "topk_f64 k=0 accepted");
+    v[3] = std::nan("");
+    CHECK(cpu_ops::ops::topk_indices(v.data(), 16, 4, out.data()) ==
+              cpu_ops::Status::kErrorInvalidArguments,
+          "topk_f64 NaN accepted");
   }
 }
 
@@ -353,6 +405,7 @@ int main(int argc, char** argv) {
   }
 
   test_topk();
+  test_topk_f64();
 
   {  // determinism: bit-identical across thread counts and runs
     ++g_cases;

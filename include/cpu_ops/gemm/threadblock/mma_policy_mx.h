@@ -1,21 +1,12 @@
 #pragma once
 
 // Mma policy for OCP MX block-scaled operands (fp8 e4m3/e5m2, fp4 e2m1 with
-// E8M0 scales every 32 elements along k). Packing decodes elements and
-// multiplies by the block scale, producing f32 panels; the mainloop and
-// accumulation are plain f32 FMA on VLEN-wide vectors (VLEN = 16, i.e.
-// 512-bit, is the device-level default on AVX-512F hosts). A and B may use
-// different storage types (e.g. e4m3 activations with e5m2 weights).
+// E8M0 scales every 32 elements along k). Packing decodes elements and folds
+// in the block scale, producing f32 panels; the mainloop is plain f32 FMA.
+// A and B may use different storage types.
 //
-// Layout constraint (the industry-standard "TN" for MX): k is the contiguous
-// dimension of both operands — A is m x k row-major, B is k x n
-// column-major — so scale blocks are contiguous runs of 32 elements.
-//
-// Decode is vectorized where possible: e4m3/e5m2 bit patterns map into f16
-// by shifts (exact, denormals included; e4m3 carries a fixed 2^-8 bias that
-// is folded into the block scale) and convert with F16C; e2m1 decodes
-// through a pshufb table of f16 high bytes. With AVX512F the same tricks run
-// 16 elements wide through _mm512_cvtph_ps. Scalar table fallback otherwise.
+// Layout constraint ("TN"): k must be the contiguous dimension of both
+// operands (A m x k row-major, B k x n column-major).
 
 #include <cstddef>
 #include <cstdint>
@@ -29,8 +20,6 @@
 #include <immintrin.h>
 #define CPU_OPS_MX_SIMD_DECODE 1
 #if defined(__AVX512F__)
-// 16-wide decode: same bit tricks widened to f16x16, converted by
-// _mm512_cvtph_ps (AVX512F). Bit-identical to the scalar decode.
 #define CPU_OPS_MX_SIMD_DECODE_512 1
 #endif
 #endif
@@ -55,9 +44,9 @@ struct traits<fp8e4m3_t> {
   static __m256 decode8(const uint8_t* row, int k) {
     const __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row + k));
     const __m128i w = _mm_cvtepu8_epi16(b);
-    // f16 = sign<<15 | (v & 0x7F) << 7: e4m3's exp+mant land in the f16
-    // exponent's low bits with the mantissa top-aligned, which is exactly the
-    // e4m3 value scaled by 2^-8 — for normals AND denormals alike.
+    // f16 = sign<<15 | (v & 0x7F) << 7 places e4m3's fields so the result is
+    // exactly the e4m3 value scaled by 2^-8 — for normals AND denormals alike
+    // (hence kDecodeBias).
     const __m128i sign = _mm_slli_epi16(_mm_and_si128(w, _mm_set1_epi16(0x80)), 8);
     const __m128i body = _mm_and_si128(_mm_slli_epi16(w, 7), _mm_set1_epi16(0x3F80));
     __m128i h = _mm_or_si128(sign, body);
@@ -160,7 +149,6 @@ struct traits<fp4e2m1_t> {
                       static_cast<char>(0xC0), static_cast<char>(0xC2),
                       static_cast<char>(0xC4), static_cast<char>(0xC6));
     const __m128i hib = _mm_shuffle_epi8(table, idx);
-    // widen, then place each looked-up byte into the f16 high byte.
     const __m256i h = _mm256_slli_epi16(_mm256_cvtepu8_epi16(hib), 8);
     return _mm512_cvtph_ps(h);
   }
@@ -209,9 +197,8 @@ inline void decode_segment(const uint8_t* row, int kk0, int len, float scale, fl
   for (; t < len; ++t) out[t * stride] = Tr::decode(row, kk0 + t) * scale;
 }
 
-// A panel pack: elements (i0+i, k0+k) -> dst[(strip*kc + k) * mr + i], with
-// the block scale folded in. Reads one operand row at a time (contiguous
-// along k); invalid rows are zero-filled.
+// A panel pack: (i0+i, k0+k) -> dst[(strip*kc + k) * mr + i], block scale
+// folded in; out-of-range rows are zero-filled.
 template <typename T>
 void mx_pack_a(const MxTensorRef<T>& a, int i0, int k0, int mc, int kc, int mr,
                float* dst) {
@@ -271,9 +258,7 @@ void mx_pack_b(const MxTensorRef<T>& b, int k0, int j0, int kc, int nc, int nr,
 
 }  // namespace mx_detail2
 
-// VLEN selects the f32 mainloop vector width; the default follows
-// simd::native_width<float>() (8 with AVX2), while AVX-512F hosts get 16 from
-// the device-level defaults (see gemm/device/gemm_mx.h).
+// VLEN selects the f32 mainloop vector width (device-level defaults give 16 on AVX-512F).
 template <typename StorageA, typename StorageB, int VLEN = simd::native_width<float>()>
 struct MxPolicy {
   static_assert(mx_detail2::is_mx_element<StorageA>::value &&

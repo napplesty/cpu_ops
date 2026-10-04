@@ -2,37 +2,15 @@
 
 // EXPERIMENTAL, opt-in. Not yet validated on AMX hardware.
 //
-// Mma policy for Intel AMX-INT8 (Sapphire Rapids and later): uint8 x int8 ->
-// int32, accumulated by TDPBUSD tile dot products. The micro-tile is a single
-// 16x16 s32 C tile fed by a 16x64-byte A tile and a 16x64-byte B tile, i.e.
-// 64 k-slices per instruction.
+// Mma policy for Intel AMX-INT8: uint8 x int8 -> int32 via TDPBUSD tile dot
+// products (one 16x16 s32 C tile fed by 16x64-byte A/B tiles). Requires
+// -march=sapphirerapids (or -mamx-tile -mamx-int8) and, on Linux, runtime
+// tile permission (arch_prctl ARCH_REQ_XCOMP_PERM), requested lazily on first
+// use; otherwise the atom falls back to a portable scalar loop.
 //
-// Build requirements: x86-64, GCC 11+ or Clang 12+,
-//   -march=sapphirerapids  (or -mamx-tile -mamx-int8)
-// The library is header-only, so the AMX kernel is instantiated in the
-// consumer's translation unit. Tile instructions are compiled only when
-// __AMX_TILE__ && __AMX_INT8__ are defined (CPU_OPS_HAS_AMX_POLICY is then
-// defined as well).
-//
-// Runtime requirement: Linux must grant permission to use the tile data
-// (arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)), which this header
-// requests lazily on first use. Without compile-time support or runtime
-// permission the atom falls back to a portable scalar loop over the same
-// packed layouts, so the policy stays correct (if slow) everywhere.
-//
-// Packed layouts (kc is padded up to a multiple of 64; padded k-slices are 0):
+// Packed layouts (kc padded up to a multiple of 64; padded k-slices are 0):
 //   A panel, per strip of 16 rows:  dst[(g * 16 + i) * 64 + t] = A(i, 64g + t)
-//   B panel, per strip of 16 cols:  dst[(g * 16 + j) * 4 + t]  = B(4g + t, j)
-// The B layout coincides with the VNNI one; each run of 16 consecutive k
-// groups is exactly one B tile row block (VNNI interleave).
-//
-// Usage:
-//   #include "cpu_ops/gemm/threadblock/mma_policy_amx.h"
-//   using GemmAmx = cpu_ops::gemm::device::Gemm<
-//       uint8_t, cpu_ops::layout::RowMajor, int8_t, cpu_ops::layout::RowMajor,
-//       int32_t, cpu_ops::layout::RowMajor, int32_t,
-//       cpu_ops::epilogue::LinearCombination<int32_t>,
-//       cpu_ops::mma::AmxGemmConfig, cpu_ops::mma::AmxPolicy>;
+//   B panel, per strip of 16 cols:  dst[(g * 16 + j) * 4 + t]  = B(4g + t, j)  (VNNI interleave)
 
 #include <cstdint>
 #include <cstring>
@@ -81,8 +59,7 @@ namespace mma {
 #if defined(CPU_OPS_HAS_AMX_POLICY)
 namespace amx_detail {
 
-// 64-byte tile configuration: palette 1, tmm0/tmm1/tmm2 each 16 rows of 64
-// bytes. The layout matches the Linux XSAVE tileconfig payload.
+// Linux XSAVE tileconfig payload: palette 1, tmm0/tmm1/tmm2 each 16 rows of 64 bytes.
 struct TileConfig {
   uint8_t palette_id;
   uint8_t start_row;
@@ -93,8 +70,6 @@ struct TileConfig {
 static_assert(sizeof(TileConfig) == 64, "tileconfig payload must be 64 bytes");
 
 // True when the OS granted tile-data permission (queried once per process).
-// Without Linux's arch_prctl interface this reports false, which keeps the
-// atom on its scalar fallback.
 inline bool runtime_available() {
 #if defined(CPU_OPS_AMX_LINUX_SYSCALL)
   static const bool granted = [] {
@@ -127,9 +102,8 @@ inline bool ensure_configured() {
 }  // namespace amx_detail
 #endif  // CPU_OPS_HAS_AMX_POLICY
 
-// Micro-kernel: one 16x16 s32 C tile (tmm0) fed by an A tile (tmm1) and a B
-// tile (tmm2) per 64 k-slices. Spills the tile to a row-major 16x16 buffer,
-// like the SME atom, so it deliberately exposes no register accumulators.
+// One 16x16 s32 C tile (tmm0) fed by A (tmm1) and B (tmm2) tiles per 64
+// k-slices; deliberately exposes no register accumulators.
 struct MmaAtomAmxInt8 {
   static constexpr int kMR = 16;
   static constexpr int kNR = 16;
@@ -157,9 +131,8 @@ struct MmaAtomAmxInt8 {
     run_scalar(a, b, kc_pad, tile);
   }
 
-  // Portable path over the packed layouts; also serves as the reference for
-  // the tile path. Note TDPBUSD saturates the s32 accumulate on overflow
-  // while this loop wraps, matching the library's scalar dpbusd fallback.
+  // Portable fallback. Note TDPBUSD saturates the s32 accumulate on overflow
+  // while this loop wraps (matching the scalar dpbusd fallback).
   static void run_scalar(const uint8_t* a, const int8_t* b, int kc_pad,
                          int32_t* tile) {
     for (int i = 0; i < kMR; ++i) {
@@ -190,7 +163,6 @@ struct AmxPolicy {
 
   template <int MR, int NR>
   using Atom = typename MmaAtomAmxInt8::check<MR, NR>::type;
-  // (MmaAtomAmxInt8 itself is the atom; check<> enforces the tile shape.)
 
   template <typename LayoutA>
   static void pack_a(TensorRef<const uint8_t, LayoutA> a, int i0, int k0, int mc, int kc,
@@ -206,7 +178,6 @@ struct AmxPolicy {
   }
 };
 
-// Tile config matching the AMX atom: 16x16 micro-tiles.
 struct AmxGemmConfig {
   static constexpr int kMR = 16;
   static constexpr int kNR = 16;

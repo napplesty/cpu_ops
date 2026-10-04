@@ -38,16 +38,12 @@ inline std::pair<int, int> split_range(int count, int parts, int idx) {
 
 }  // namespace detail
 
-// Splits an m x n output into up to num_threads rectangular regions whose
-// boundaries are aligned to mr x nr micro-tiles. The tm x tn grid is chosen to
-// fill the thread count first and to minimize panel re-packing traffic
-// (tn*m*k + tm*k*n) second, since every region packs its own A rows and B
-// columns.
-//
-// With k_slices > 1 the k range is additionally cut into contiguous slices
-// and crossed with the m x n grid, so the result holds grid_regions *
-// k_slices regions; each slice's regions must write to their own partial-sum
-// slab (indexed by slice) that a later reduction pass combines.
+// Splits an m x n output into up to num_threads rectangular regions aligned to
+// mr x nr micro-tiles; the grid fills the thread count first, then minimizes
+// panel re-packing (every region packs its own A rows and B columns). With
+// k_slices > 1 the k range is also cut into contiguous slices crossed with the
+// grid; each slice's regions must write to their own partial-sum slab (indexed
+// by slice) that a later reduction pass combines.
 inline std::vector<GemmRegion> partition_gemm(int m, int n, int k, int mr, int nr,
                                               int num_threads, int k_slices = 1) {
   if (num_threads < 1) num_threads = 1;
@@ -55,14 +51,6 @@ inline std::vector<GemmRegion> partition_gemm(int m, int n, int k, int mr, int n
   const int mt = (m + mr - 1) / mr;
   const int nt = (n + nr - 1) / nr;
 
-  // Every region packs its own A rows and B columns, so a tm x tn grid costs
-  // tn*m*k + tm*k*n packed elements in total. Search the factor pairs of the
-  // thread count for the grid that maximizes occupancy first and minimizes
-  // that packing traffic second. (Splitting columns only, for example,
-  // re-packs the whole of A once per thread.)
-  //
-  // With k_slices > 1 the k dimension absorbs part of the parallelism, so the
-  // m x n grid is sized for num_threads / k_slices threads.
   const int grid_threads = std::max(1, num_threads / k_slices);
   int best_tm = 1, best_tn = 1;
   long best_regions = -1;

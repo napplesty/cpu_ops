@@ -4,11 +4,6 @@
 //
 //   using LinearRelu = GemmFusedF32<RowMajor, RowMajor, RowMajor,
 //                                   epilogue::BiasAdd<float>, epilogue::Relu>;
-//   LinearRelu::Arguments args{...};
-//   args.epilogue = {1.0f, 1.0f, epilogue::Chain<BiasAdd<float>, Relu>{...}};
-//
-// The library is header-only: including this header instantiates the whole
-// fused kernel in your translation unit.
 
 #include "cpu_ops/epilogue/fusion.h"
 #include "cpu_ops/gemm/device/gemm.h"

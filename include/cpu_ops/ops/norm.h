@@ -1,24 +1,14 @@
 #pragma once
 
-// Normalization kernels over rows of a [rows x cols] matrix (cols
-// contiguous): rmsnorm, fused add+rmsnorm (the transformer-block
-// workhorse: residual sum and its normalized form in one pass over the
-// inputs), and layernorm.
+// Row-wise normalization kernels over a [rows x cols] matrix (cols contiguous):
 //
 //   rmsnorm:     y[i,j]  = x[i,j] / rms_i * w[j],  rms_i = sqrt(mean(x_i²)+eps)
 //   fused_add:   r_out[i,j] = x[i,j] + r[i,j]
 //                y[i,j]     = r_out[i,j] / rms(r_out_i) * w[j]
 //   layernorm:   y[i,j]  = (x[i,j] − mu_i) / sqrt(var_i + eps) * w[j]
 //
-// Compute is f32: row statistics accumulate through two independent W-lane
-// accumulators with a fixed reduction tree, the scale factors use scalar
-// IEEE 1/sqrtf. Storage may be f32 / float16_t / bfloat16_t (narrow
-// outputs round to nearest-even scalar-wise). fused_add stashes the summed
-// residual in a per-thread f32 row scratch so the inputs are read exactly
-// once from memory.
-//
-// Determinism: per-row fixed evaluation order — bit-identical for any
-// thread count.
+// Compute is f32; narrow outputs round to nearest-even. Determinism: per-row
+// fixed evaluation order — bit-identical for any thread count.
 
 #include <algorithm>
 #include <cmath>
@@ -53,7 +43,7 @@ inline simd::Vec<float, simd::native_width<float>()> widen4(const T* q) {
   }
 }
 
-// Σ float(x)² and Σ float(x) over [0, n) in one pass; fixed reduction.
+// Σ float(x)² and Σ float(x) over [0, n) in one pass; fixed reduction order.
 template <typename T>
 inline void sum_sumsq_row(const T* x, int n, float* s_out, float* ss_out) {
   constexpr int W = simd::native_width<float>();
@@ -109,7 +99,7 @@ inline void scale_row(const float* src, const T* w, T* y, int n, float s) {
   for (; i < n; ++i) y[i] = T(src[i] * s * static_cast<float>(w[i]));
 }
 
-// Store W f32 lanes to narrow storage with hardware/vector RNE converts.
+// Store W f32 lanes to narrow storage (RNE).
 template <typename T>
 inline void narrow_store(const simd::Vec<float, simd::native_width<float>()>& v,
                          T* q);
@@ -172,7 +162,6 @@ inline void add_row_f32(const T* x, const T* r, float* dst, int n) {
 
 }  // namespace norm_detail
 
-// y[i,j] = x[i,j] / rms_i * w[j]
 template <typename T>
 Status rmsnorm(const T* x, const T* w, T* y, int rows, int cols, float eps,
                int num_threads = 0) {
@@ -193,15 +182,12 @@ Status rmsnorm(const T* x, const T* w, T* y, int rows, int cols, float eps,
       T* yr = y + static_cast<std::size_t>(r) * cols;
       const float inv =
           1.0f / std::sqrtf(norm_detail::sumsq_row(xr, cols) * inv_cols + eps);
-      // Second pass re-reads xr — the row is L1-resident by then.
       norm_detail::scale_row_t(xr, w, yr, cols, inv);
     }
   });
   return Status::kSuccess;
 }
 
-// res_out[i,j] = x[i,j] + res[i,j];  y[i,j] = res_out[i,j] / rms_i * w[j].
-// One read pass over x and res; the sum lives in a per-thread f32 scratch.
 template <typename T>
 Status fused_add_rmsnorm(const T* x, const T* res, const T* w, T* y, T* res_out,
                          int rows, int cols, float eps, int num_threads = 0) {
@@ -244,7 +230,6 @@ Status fused_add_rmsnorm(const T* x, const T* res, const T* w, T* y, T* res_out,
   return Status::kSuccess;
 }
 
-// y[i,j] = (x[i,j] − mu_i) / sqrt(var_i + eps) * w[j]
 template <typename T>
 Status layernorm(const T* x, const T* w, T* y, int rows, int cols, float eps,
                  int num_threads = 0) {

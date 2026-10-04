@@ -2,14 +2,11 @@
 
 // GEMM for OCP MX block-scaled operands:
 //   D = alpha * (A .* scalesA) * (B .* scalesB) + beta * C
-//
 // A (m x k) and B (k x n) carry packed low-precision elements plus one E8M0
-// scale per 32 elements along k; C/D/alpha/beta are f32. k must be the
-// contiguous dimension of both operands (A row-major, B column-major, the
-// usual "TN" arrangement for MX): scale blocks are contiguous 32-element
-// runs. Decoding happens at pack time; compute and accumulation are f32.
-// On AVX-512F hosts the default config widens the f32 mainloop to 512-bit
-// vectors with the Fma512 tile shape (see detail::GemmMxDefaults).
+// scale per 32 elements along k; k must be the contiguous dimension of both
+// ("TN": A row-major, B column-major). C/D/alpha/beta are f32.
+
+#include <type_traits>
 
 #include "cpu_ops/epilogue/linear_combination.h"
 #include "cpu_ops/gemm/device/gemm.h"
@@ -29,10 +26,8 @@ namespace device {
 
 namespace detail {
 
-// ISA-dependent defaults of GemmMx. Decode at pack time is already 16-wide on
-// AVX-512F hosts; there the f32 mainloop additionally switches to 512-bit
-// vectors (VLEN = 16) and the Zen-4-tuned Fma512 tile shape, matching the
-// f32 Gemm default. Explicit Config_/MmaPolicy_ arguments always override.
+// ISA-dependent defaults of GemmMx. Explicit Config_/MmaPolicy_ arguments
+// always override.
 template <typename StorageA, typename StorageB>
 struct GemmMxDefaults {
 #if defined(CPU_OPS_SIMD_AVX512F)
@@ -59,6 +54,14 @@ class GemmMx {
   using Config = Config_;
   using MmaPolicy = MmaPolicy_;
 
+  static_assert(std::is_same<StorageA, typename MmaPolicy::ElemA>::value &&
+                    std::is_same<StorageB, typename MmaPolicy::ElemB>::value &&
+                    std::is_same<float, typename MmaPolicy::AccT>::value,
+                "storage types must match the mma policy's ElemA/ElemB, and the "
+                "policy's AccT must be float");
+  static_assert(threadblock::epilogue_params<Epilogue>::value,
+                "Epilogue must provide a Params type and be constructible from it");
+
   struct Arguments {
     GemmCoord problem_size;
     MxTensorRef<StorageA> ref_A;  // m x k, row-major (k contiguous)
@@ -66,8 +69,7 @@ class GemmMx {
     TensorRef<const float, LayoutC> ref_C;
     TensorRef<float, LayoutC> ref_D;
     typename Epilogue::Params epilogue;
-    // Same semantics as Gemm::Arguments::split_k_slices: 0 automatic,
-    // 1 never, >1 forced (clamped so no slice is empty).
+    // Same semantics as Gemm::Arguments::split_k_slices.
     int split_k_slices = 0;
   };
 
@@ -81,13 +83,8 @@ class GemmMx {
     if (m == 0 || n == 0) return Status::kSuccess;
 
     if (k == 0) {
-      // Degenerate product: fold beta * C into D without touching A or B.
-      const Epilogue epilogue(args.epilogue);
-      for (int i = 0; i < m; ++i) {
-        for (int j = 0; j < n; ++j) {
-          args.ref_D.at(i, j) = epilogue(0.0f, args.ref_C.at(i, j), true, true, i, j);
-        }
-      }
+      kernel::detail::write_zero_k(args.ref_C, args.ref_D, m, n,
+                                   Epilogue(args.epilogue));
       return Status::kSuccess;
     }
 
@@ -97,9 +94,8 @@ class GemmMx {
         !args.ref_D.data()) {
       return Status::kErrorInvalidArguments;
     }
-    // Both operands are contiguous along k: ld counts elements along k for A
-    // (m x k row-major) and along k for B (k x n column-major). Scale arrays
-    // follow the same layout with ceil(k / 32) entries per row/column.
+    // ld counts elements along k for both operands; scale arrays follow with
+    // ceil(k / 32) entries per row/column.
     const int scale_ld_min = (k + 31) / 32;
     if (a.ld < k || b.ld < k || a.ld_scales < scale_ld_min ||
         b.ld_scales < scale_ld_min) {
@@ -130,11 +126,9 @@ using GemmMxE5M2 = GemmMx<fp8e5m2_t, fp8e5m2_t, LayoutC>;
 template <typename LayoutC = layout::RowMajor>
 using GemmMxE2M1 = GemmMx<fp4e2m1_t, fp4e2m1_t, LayoutC>;
 
-// Opt-in VNNI variants: per-block int8 requantization + byte dot products
-// (vpdpbusd) instead of the exact f32 decode — see mma_policy_mx_vnni.h for
-// the numerics trade-off (e2m1 exact; e4m3/e5m2 per-block int8 accuracy; no
-// inf/nan). Tile shapes follow the int8 VNNI GEMM defaults (512-bit on
-// AVX512-VNNI hosts).
+// Opt-in VNNI variants: per-block int8 requantization + vpdpbusd instead of
+// the exact f32 decode. Numerics: e2m1 exact; e4m3/e5m2 per-block int8
+// accuracy; no inf/nan propagation (see mma_policy_mx_vnni.h).
 #if defined(CPU_OPS_SIMD_AVX512VNNI)
 template <typename LayoutC = layout::RowMajor>
 using GemmMxE4M3Vnni =

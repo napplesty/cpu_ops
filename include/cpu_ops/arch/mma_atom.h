@@ -5,15 +5,9 @@
 namespace cpu_ops {
 namespace mma {
 
-// Register-resident micro-kernel: keeps a MR x NR accumulator tile in SIMD
-// registers and streams packed panels over k.
-//
-// Packed layouts (produced by pack_a / pack_b):
+// Register-resident micro-kernel over packed panels:
 //   a: kc steps of MR contiguous scalars, row i of step k at a[k * MR + i]
 //   b: kc steps of NR contiguous scalars, col j of step k at b[k * NR + j]
-//
-// Per k step: broadcast MR scalars of A, load NR/VLEN vectors of B, and issue
-// MR * (NR/VLEN) fused multiply-adds.
 template <typename T, int MR_, int NR_, int VLEN = simd::native_width<T>()>
 struct MmaAtom {
   static constexpr int kMR = MR_;
@@ -43,13 +37,11 @@ struct MmaAtom {
     }
   }
 
-  // Spills the accumulator tile to a row-major MR x NR scalar buffer.
   void store_tile(T* tile) const {
     for (int i = 0; i < kMR; ++i)
       for (int w = 0; w < kVecN; ++w) acc[i][w].store(tile + i * kNR + w * VLEN);
   }
 
-  // Single-entry form used by the macro kernel: clear, accumulate, spill.
   void run(const T* a, const T* b, int kc, T* tile) {
     clear();
     mma(a, b, kc);

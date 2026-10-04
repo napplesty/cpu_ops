@@ -1,19 +1,5 @@
 #pragma once
 
-// Policy describing how BlockGemm computes one micro-tile with FMA-based
-// SIMD vectors. A policy provides:
-//
-//   using ElemA / ElemB / AccT;                    // operand and accumulator types
-//   using PackedA / PackedB;                       // packed panel element types (== ElemA/ElemB
-//                                                  // unless packing converts, e.g. widening)
-//   static constexpr int kKStep;                   // k granularity (1 here, 4 for dot-product paths)
-//   static constexpr int pad_kc(int kc);           // k extent padded to kKStep
-//   template <int MR, int NR> using Atom = ...;    // micro-kernel with run(a, b, kc, tile)
-//   pack_a / pack_b;                               // panel packing into the atom's layout
-//
-// Packed panels are laid out per micro-tile strip: strip s covers
-// kc_pad * MR (A) resp. kc_pad * NR (B) contiguous elements.
-
 #include "cpu_ops/arch/mma_atom.h"
 #include "cpu_ops/gemm/threadblock/pack.h"
 #include "cpu_ops/tensor_ref.h"
@@ -26,8 +12,7 @@ struct FmaPolicy {
   using ElemA = T;
   using ElemB = T;
   using AccT = T;
-  // Element types of the packed panels; differ from ElemA/ElemB for policies
-  // that convert during packing (see mma_policy_widen.h).
+  // PackedA/PackedB differ from ElemA/ElemB for policies that convert during packing.
   using PackedA = T;
   using PackedB = T;
 
@@ -50,12 +35,7 @@ struct FmaPolicy {
   }
 };
 
-// f32 policy pinned to 512-bit vectors (VLEN = 16) regardless of
-// native_width<float>() — the float width stays at 8 for ISA-tuning reasons
-// (see simd.h), so this policy is how the mainloop exploits AVX-512F: twice
-// the lanes per FMA plus 32 architectural registers allow a deeper
-// accumulator tile. On non-AVX-512 hosts it still compiles and runs through
-// the portable Vec<float, 16> fallback, which is how the tests cover it.
+// f32 policy pinned to 512-bit vectors (VLEN = 16): the opt-in AVX-512F path.
 struct Fma512Policy {
   using ElemA = float;
   using ElemB = float;
@@ -82,14 +62,11 @@ struct Fma512Policy {
   }
 };
 
-// Tile config for Fma512Policy: MR x NR = 8 x 32 keeps 16 of 32 ZMM as
-// accumulators. NC/KC = 512 measured best on Zen 4 (B panel = 1 MiB f32,
-// one L2); see the ISA notes in README.
 struct Fma512GemmConfig {
   static constexpr int kMR = 8;
-  static constexpr int kNR = 32;  // 2 x 16 f32 lanes
-  static constexpr int kMC = 128;  // multiple of kMR
-  static constexpr int kNC = 512;  // multiple of kNR
+  static constexpr int kNR = 32;
+  static constexpr int kMC = 128;
+  static constexpr int kNC = 512;
   static constexpr int kKC = 512;
 };
 

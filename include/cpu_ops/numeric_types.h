@@ -1,9 +1,8 @@
 #pragma once
 
-// Narrow floating-point storage types. They are pure containers: arithmetic
-// is performed by widening to float (the GEMM mainloop converts panels to
-// f32 at pack time, see mma_policy_widen.h). Conversions to/from float are
-// IEEE round-to-nearest-even and preserve infinities and NaNs.
+// Narrow floating-point storage types (pure containers; arithmetic widens to
+// float). Conversions to/from float are IEEE round-to-nearest-even and
+// preserve infinities and NaNs.
 
 #include <cstdint>
 #include <cstring>
@@ -77,8 +76,6 @@ struct float16_t {
     if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00);  // overflow -> inf
     if (exp <= 0) {
       if (exp < -10) return static_cast<uint16_t>(sign);  // underflow -> zero
-      // Denormal result: round mantissa (with implicit leading 1) to the
-      // remaining precision.
       const uint32_t mant24 = mant | 0x800000;
       const int shift = 14 - exp;  // in [14, 24]
       uint32_t half = mant24 >> shift;

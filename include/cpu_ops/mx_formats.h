@@ -1,14 +1,10 @@
 #pragma once
 
-// OCP MX (Microscaling) element formats: fp8 e4m3 / e5m2 and fp4 e2m1, with
-// an E8M0 power-of-two scale shared by every block of 32 elements along k.
-//
-// These are storage formats only. Decoding to float goes through constexpr
-// lookup tables (exact by construction); encoding from float is
-// round-to-nearest-even with saturation at the format's maximum magnitude.
-//
-// fp4 packs two elements per byte; following the OCP MX convention the
-// element with the even flat index sits in the byte's low nibble.
+// OCP MX (Microscaling) element formats: fp8 e4m3 / e5m2 and fp4 e2m1, with an
+// E8M0 power-of-two scale shared by every block of 32 elements along k.
+// Storage formats only: decode via constexpr lookup tables (exact), encode
+// round-to-nearest-even with saturation. fp4 packs two elements per byte, the
+// even flat index in the low nibble (OCP convention).
 
 #include <array>
 #include <cmath>
@@ -42,8 +38,7 @@ constexpr std::array<uint32_t, 256> build_e4m3_lut() {
       if (mant == 0) {
         f = sign << 31;
       } else {
-        // Denormal mant * 2^-9: p = position of the top set bit gives the
-        // exponent, the remaining bits the fraction.
+        // Denormal: the top set bit position gives the exponent.
         const uint32_t p = (mant & 0x4) ? 2 : ((mant & 0x2) ? 1 : 0);
         f = f32_bits(sign, p + 127 - 9, (mant & ((1u << p) - 1)) << (23 - p));
       }
@@ -204,9 +199,8 @@ struct fp8e5m2_t {
   }
 };
 
-// 4-bit float, 1-2-1. Two elements share a byte, so this type only provides
-// nibble-level conversion helpers; storage addressing lives in the GEMM
-// packing code (mx_traits in mma_policy_mx.h).
+// 4-bit float, 1-2-1. Two elements share a byte: nibble-level conversion
+// helpers only; storage addressing lives in the GEMM packing code.
 struct fp4e2m1_t {
   static constexpr std::array<uint32_t, 16> kLut = mx_detail::build_e2m1_lut();
 
